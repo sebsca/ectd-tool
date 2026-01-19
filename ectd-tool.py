@@ -17,6 +17,38 @@ from lxml import etree
 # Utility functions
 # =========================================================
 
+XLINK_NS_CANONICAL = "http://www.w3.org/1999/xlink"
+XLINK_NS_LEGACY = "http://www.w3c.org/1999/xlink"
+ICH_NS_DEFAULT = "http://www.ich.org/ectd"
+EU_NS_DEFAULT = "http://europa.eu.int"
+XML_NS = "http://www.w3.org/XML/1998/namespace"
+
+UTIL_DTD_DIR = Path("util") / "dtd"
+UTIL_STYLE_DIR = Path("util") / "style"
+
+ICH_DTD_FILENAME = "ich-ectd-3-2.dtd"
+EU_DTD_FILENAME = "eu-regional.dtd"
+EU_ENVELOPE_MOD_FILENAME = "eu-envelope.mod"
+
+ICH_XSL_FILENAME = "ectd-2-0.xsl"
+EU_XSL_FILENAME = "eu-regional.xsl"
+
+EU_DEFAULTS = {
+    "env_country": "at",
+    "submission_type": "none",
+    "submission_mode": "single",
+    "procedure_number": "1",
+    "submission_unit_type": "initial",
+    "applicant_name": "Unknown applicant",
+    "agency_code": "EU-EMA",
+    "procedure_type": "national",
+    "invented_name": "Unknown product",
+    "submission_description": "Not provided",
+    "pi_country": "common",
+    "pi_lang": "en",
+    "pi_type": "other",
+}
+
 def md5_checksum(filepath: Path) -> str:
     m = hashlib.md5()
     with open(filepath, "rb") as f:
@@ -27,6 +59,7 @@ def md5_checksum(filepath: Path) -> str:
 METADATA_FIELDS = [
     "file_path",
     "title",
+    "attributes",
     "operation",
     "modified-leaf",
     "modified-href",
@@ -55,6 +88,9 @@ def checksum_for_path(seq_dir: Path, file_path: str) -> tuple[str, bool]:
         if not file_abs.parent.exists():
             print(f"⚠ Missing directory for leaf: {file_abs.parent}")
         print(f"⚠ Missing file for leaf: {file_path}")
+        return "", False
+    if file_abs.is_dir():
+        print(f"⚠ Skipping checksum for directory path: {file_path}")
         return "", False
     return md5_checksum(file_abs), True
 
@@ -321,6 +357,7 @@ def _extract_leaf_rows_from_xml(
     seq_dir: Path,
     base_prefix: str | None = None,
     include_ctd_toc: bool = True,
+    attr_map: dict[str, set[str]] | None = None,
 ) -> list[dict[str, str]]:
     if not xml_path.exists():
         return []
@@ -355,6 +392,20 @@ def _extract_leaf_rows_from_xml(
             parent = leaf.getparent()
             if parent is not None and parent.tag:
                 row["ctd_toc"] = parent.tag.split("}", 1)[-1]
+        if attr_map is not None:
+            parent = leaf.getparent()
+            if parent is not None and parent.tag:
+                allowed = attr_map.get(parent.tag.split("}", 1)[-1], set())
+                attrs: dict[str, str] = {}
+                for name in sorted(allowed):
+                    if name == "xml:lang":
+                        val = parent.get("{%s}lang" % XML_NS)
+                    else:
+                        val = parent.get(name)
+                    if val:
+                        attrs[name] = val
+                if attrs:
+                    row["attributes"] = " ".join(f'{k}="{v}"' for k, v in attrs.items())
         rows.append(row)
     return rows
 
@@ -405,8 +456,23 @@ def extract_metadata_from_xml(seq_dir: Path, xlsx_path: Path) -> tuple[int, int,
     appended = 0
     index_xml = seq_dir / "index.xml"
     eu_xml = seq_dir / "m1" / "eu" / "eu-regional.xml"
-    rows = _extract_leaf_rows_from_xml(index_xml, seq_dir, include_ctd_toc=True)
-    rows += _extract_leaf_rows_from_xml(eu_xml, seq_dir, base_prefix="m1/eu", include_ctd_toc=False)
+    ich_dtd = seq_dir / UTIL_DTD_DIR / ICH_DTD_FILENAME
+    eu_dtd = seq_dir / UTIL_DTD_DIR / EU_DTD_FILENAME
+    ich_attr_map = _parse_dtd_attlist(ich_dtd) if ich_dtd.exists() else {}
+    eu_attr_map = _parse_dtd_attlist(eu_dtd) if eu_dtd.exists() else {}
+    rows = _extract_leaf_rows_from_xml(
+        index_xml,
+        seq_dir,
+        include_ctd_toc=True,
+        attr_map=ich_attr_map,
+    )
+    rows += _extract_leaf_rows_from_xml(
+        eu_xml,
+        seq_dir,
+        base_prefix="m1/eu",
+        include_ctd_toc=False,
+        attr_map=eu_attr_map,
+    )
 
     for row in rows:
         file_path = _norm_href(row.get("file_path") or "")
@@ -473,8 +539,8 @@ def _leaf_href(leaf) -> str:
     """Extract href from a leaf element (xlink:href or href)."""
     # Prefer explicit xlink href if present
     for k in (
-        "{http://www.w3.org/1999/xlink}href",
-        "{http://www.w3c.org/1999/xlink}href",
+        "{%s}href" % XLINK_NS_CANONICAL,
+        "{%s}href" % XLINK_NS_LEGACY,
         "href",
     ):
         if k in leaf.attrib:
@@ -484,6 +550,128 @@ def _leaf_href(leaf) -> str:
         if k.endswith("}href") or k == "href":
             return _norm_href(v or "")
     return ""
+
+def _parse_custom_attributes(raw: str) -> dict[str, str]:
+    """Parse attributes in the form: key="value" key2='value2'."""
+    raw = (raw or "").strip()
+    if not raw:
+        return {}
+    # Normalize smart quotes to ASCII for Excel-friendly input.
+    raw = (
+        raw.replace("\u201c", '"')
+        .replace("\u201d", '"')
+        .replace("\u2018", "'")
+        .replace("\u2019", "'")
+    )
+    attrs: dict[str, str] = {}
+    pattern = r'([^\s=]+)\s*=\s*(?:"([^"]*)"|\'([^\']*)\')'
+    for name, v1, v2 in re.findall(pattern, raw):
+        value = v1 if v1 is not None else v2
+        if name:
+            attrs[name] = value
+    return attrs
+
+def _tokenize_dtd_attlist(content: str) -> list[str]:
+    tokens: list[str] = []
+    i = 0
+    n = len(content)
+    while i < n:
+        c = content[i]
+        if c.isspace():
+            i += 1
+            continue
+        if c in ("'", '"'):
+            quote = c
+            i += 1
+            start = i
+            while i < n and content[i] != quote:
+                i += 1
+            tokens.append(content[start:i])
+            i += 1
+            continue
+        if c == "(":
+            depth = 1
+            start = i
+            i += 1
+            while i < n and depth > 0:
+                if content[i] == "(":
+                    depth += 1
+                elif content[i] == ")":
+                    depth -= 1
+                i += 1
+            tokens.append(content[start:i])
+            continue
+        start = i
+        while i < n and not content[i].isspace():
+            i += 1
+        tokens.append(content[start:i])
+    return tokens
+
+def _parse_dtd_attlist(dtd_path: Path) -> dict[str, set[str]]:
+    text = dtd_path.read_text(encoding="utf-8", errors="ignore")
+    text = re.sub(r"<!--.*?-->", "", text, flags=re.S)
+    entities = _parse_dtd_entities(text)
+    text = _expand_entities(text, entities)
+    out: dict[str, set[str]] = {}
+    for match in re.finditer(r"<!ATTLIST\s+([^\s>]+)\s+([^>]+)>", text, flags=re.S):
+        element = match.group(1)
+        content = match.group(2)
+        tokens = _tokenize_dtd_attlist(content)
+        idx = 0
+        attrs: set[str] = set()
+        while idx < len(tokens):
+            name = tokens[idx]
+            idx += 1
+            if name.startswith("%") and name.endswith(";"):
+                continue
+            if idx >= len(tokens):
+                break
+            idx += 1  # attr type
+            if idx >= len(tokens):
+                break
+            default = tokens[idx]
+            idx += 1
+            if default == "#FIXED" and idx < len(tokens):
+                idx += 1
+            attrs.add(name)
+        if attrs:
+            out[element] = attrs
+    return out
+
+def _normalize_attr_name(name: str) -> str:
+    if name == "xml:lang":
+        return "{%s}lang" % XML_NS
+    return name
+
+def _is_directory_path(seq_dir: Path, file_path: str) -> bool:
+    path_str = (file_path or "").strip()
+    if not path_str:
+        return False
+    if path_str.endswith("/"):
+        return True
+    candidate = Path(path_str)
+    if not candidate.is_absolute():
+        candidate = (seq_dir / candidate).resolve()
+    return candidate.exists() and candidate.is_dir()
+
+def _allowed_attrs_for_element(attr_map: dict[str, set[str]], element_tag: str) -> set[str]:
+    local = element_tag.split("}", 1)[-1]
+    return attr_map.get(local, set())
+
+def _filter_allowed_attrs(
+    custom_attrs: dict[str, str],
+    allowed_attrs: set[str],
+    context: str,
+    element_tag: str,
+) -> dict[str, str]:
+    filtered: dict[str, str] = {}
+    local = element_tag.split("}", 1)[-1]
+    for name, value in custom_attrs.items():
+        if name not in allowed_attrs:
+            print(f"⚠ Attribute '{name}' not allowed for {local} ({context})")
+            continue
+        filtered[name] = value
+    return filtered
 
 
 def _referenced_xmls_from_index(prev_dir: Path) -> list[Path]:
@@ -670,6 +858,124 @@ def _parse_dtd_structure(dtd_path: Path) -> dict[str, list[str]]:
             out[name] = children
     return out
 
+def _find_dtd_public_id(text: str) -> str:
+    match = re.search(r'PUBLIC\s+"([^"]+)"', text)
+    return match.group(1) if match else ""
+
+def _find_dtd_root_element(text: str, preferred: list[str]) -> str:
+    for name in preferred:
+        if re.search(rf'<!ELEMENT\s+{re.escape(name)}\b', text):
+            return name
+    match = re.search(r'<!ELEMENT\s+([^\s>]+)\s', text)
+    return match.group(1) if match else ""
+
+def _find_dtd_fixed_value(text: str, element: str, attr: str) -> str:
+    pattern = rf'<!ATTLIST\s+{re.escape(element)}\s+.*?\b{re.escape(attr)}\b[^#]*#FIXED\s+(?:"([^"]+)"|\'([^\']+)\')'
+    match = re.search(pattern, text, flags=re.S)
+    if not match:
+        return ""
+    return match.group(1) or match.group(2) or ""
+
+def _parse_dtd_enum_list(raw: str) -> list[str]:
+    cleaned = raw.strip()
+    if cleaned.startswith("(") and cleaned.endswith(")"):
+        cleaned = cleaned[1:-1]
+    tokens = []
+    for part in cleaned.split("|"):
+        tok = part.strip()
+        if tok:
+            tokens.append(tok)
+    return tokens
+
+def _find_dtd_entity_enum(text: str, entity_name: str) -> list[str]:
+    pattern = rf'<!ENTITY\s+%\s*{re.escape(entity_name)}\s+(?:"([^"]+)"|\'([^\']+)\')\s*>'
+    match = re.search(pattern, text, flags=re.S)
+    if not match:
+        return []
+    raw = match.group(1) or match.group(2) or ""
+    return _parse_dtd_enum_list(raw)
+
+def _find_dtd_attlist_enum(text: str, element: str, attr: str) -> list[str]:
+    pattern = rf'<!ATTLIST\s+{re.escape(element)}\s+[^>]*?\b{re.escape(attr)}\s+\(([^)]+)\)'
+    match = re.search(pattern, text, flags=re.S)
+    if not match:
+        return []
+    return _parse_dtd_enum_list(match.group(1))
+
+def _build_doctype(root_name: str, system_id: str, public_id: str = "") -> str:
+    if public_id:
+        return f'<!DOCTYPE {root_name} PUBLIC "{public_id}" "{system_id}">'
+    return f'<!DOCTYPE {root_name} SYSTEM "{system_id}">'
+
+def _load_ich_dtd_info(seq_dir: Path) -> dict[str, object]:
+    info: dict[str, object] = {}
+    dtd_path = seq_dir / UTIL_DTD_DIR / ICH_DTD_FILENAME
+    if not dtd_path.exists():
+        return info
+    text = dtd_path.read_text(encoding="utf-8", errors="ignore")
+    root_name = _find_dtd_root_element(text, ["ectd:ectd"])
+    if root_name:
+        info["root_name"] = root_name
+        info["ns_ectd"] = _find_dtd_fixed_value(text, root_name, "xmlns:ectd")
+        info["ns_xlink"] = _find_dtd_fixed_value(text, root_name, "xmlns:xlink")
+        info["dtd_version"] = _find_dtd_fixed_value(text, root_name, "dtd-version")
+    info["public_id"] = _find_dtd_public_id(text)
+    order_map = _parse_dtd_structure(dtd_path)
+    info["order_map"] = order_map
+    module_map: dict[str, str] = {}
+    module_order: list[str] = []
+    if root_name and root_name in order_map:
+        for child in order_map[root_name]:
+            norm = _normalize_key(child)
+            for mk in ("m1", "m2", "m3", "m4", "m5"):
+                if norm.startswith(mk):
+                    if mk not in module_map:
+                        module_map[mk] = child
+                        module_order.append(mk)
+                    break
+    if module_map:
+        info["module_map"] = module_map
+    if module_order:
+        info["module_order"] = module_order
+    return info
+
+def _load_eu_dtd_info(seq_dir: Path) -> dict[str, object]:
+    info: dict[str, object] = {}
+    eu_dtd = seq_dir / UTIL_DTD_DIR / EU_DTD_FILENAME
+    env_mod = seq_dir / UTIL_DTD_DIR / EU_ENVELOPE_MOD_FILENAME
+    if eu_dtd.exists():
+        text = eu_dtd.read_text(encoding="utf-8", errors="ignore")
+        root_name = _find_dtd_root_element(text, ["eu:eu-backbone"])
+        if root_name:
+            info["root_name"] = root_name
+            info["ns_eu"] = _find_dtd_fixed_value(text, root_name, "xmlns:eu")
+            info["ns_xlink"] = _find_dtd_fixed_value(text, root_name, "xmlns:xlink")
+            info["dtd_version"] = _find_dtd_fixed_value(text, root_name, "dtd-version")
+        info["public_id"] = _find_dtd_public_id(text)
+        info["countries"] = set(_find_dtd_entity_enum(text, "countries"))
+        info["languages"] = set(_find_dtd_entity_enum(text, "languages"))
+        info["pi_types"] = set(_find_dtd_attlist_enum(text, "pi-doc", "type"))
+        order_map = _parse_dtd_structure(eu_dtd)
+        info["order_map"] = order_map
+        m1_order = order_map.get("m1-eu", [])
+        if m1_order:
+            info["m1_order"] = m1_order
+            child_order_maps: dict[str, dict[str, int]] = {}
+            for tag in m1_order:
+                children = order_map.get(tag)
+                if children:
+                    child_order_maps[tag] = {child: idx for idx, child in enumerate(children)}
+            info["child_order_maps"] = child_order_maps
+    if env_mod.exists():
+        text = env_mod.read_text(encoding="utf-8", errors="ignore")
+        info["env_countries"] = set(_find_dtd_entity_enum(text, "env-countries"))
+        info["submission_types"] = set(_find_dtd_attlist_enum(text, "submission", "type"))
+        info["submission_modes"] = set(_find_dtd_attlist_enum(text, "submission", "mode"))
+        info["submission_unit_types"] = set(_find_dtd_attlist_enum(text, "submission-unit", "type"))
+        info["agency_codes"] = set(_find_dtd_attlist_enum(text, "agency", "code"))
+        info["procedure_types"] = set(_find_dtd_attlist_enum(text, "procedure", "type"))
+    return info
+
 def _order_for_parent(order_map: dict[str, list[str]], parent_tag: str) -> list[str]:
     tag = parent_tag.split("}", 1)[-1]
     if tag in order_map:
@@ -848,26 +1154,33 @@ def create_index_xml(
     base_dir: Path,
     seq_num: int,
     mapping_path: Path | None = None,
+    xsl_path: str | None = None,
 ):
     """Build index.xml (ICH eCTD 3.2) with support for new/replace/delete/append."""
-    NS = "http://www.ich.org/ectd"
-    XLINK = "http://www.w3c.org/1999/xlink"
+    dtd_info = _load_ich_dtd_info(seq_dir)
+    root_name = dtd_info.get("root_name") or "ectd:ectd"
+    NS = dtd_info.get("ns_ectd") or ICH_NS_DEFAULT
+    XLINK = dtd_info.get("ns_xlink") or XLINK_NS_CANONICAL
+    dtd_version = dtd_info.get("dtd_version") or "3.2"
+    root_prefix, root_local = root_name.split(":", 1) if ":" in root_name else ("ectd", root_name)
 
     root = etree.Element(
-        "{%s}ectd" % NS,
-        nsmap={"xlink": XLINK, "ectd": NS},
-        attrib={"dtd-version": "3.2"}
+        "{%s}%s" % (NS, root_local),
+        nsmap={root_prefix: NS, "xlink": XLINK},
+        attrib={"dtd-version": dtd_version}
     )
 
-    module_map = {
+    module_map = dtd_info.get("module_map") or {
         "m1": "m1-administrative-information-and-prescribing-information",
         "m2": "m2-common-technical-document-summaries",
         "m3": "m3-quality",
         "m4": "m4-nonclinical-study-reports",
         "m5": "m5-clinical-study-reports",
     }
-    order_map: dict[str, list[str]] = {}
-    dtd_path = seq_dir / "util" / "dtd" / "ich-ectd-3-2.dtd"
+    order_map: dict[str, list[str]] = dtd_info.get("order_map") or {}
+    module_order = dtd_info.get("module_order") or ["m1", "m2", "m3", "m4", "m5"]
+    dtd_path = seq_dir / UTIL_DTD_DIR / ICH_DTD_FILENAME
+    attr_map: dict[str, set[str]] = {}
     dir_mapping_index: dict[int, list[dict]] = {}
     file_mapping_index: dict[int, list[dict]] = {}
     if mapping_path is None:
@@ -875,19 +1188,26 @@ def create_index_xml(
     if mapping_path.exists():
         dir_mapping_index, file_mapping_index = _load_ctd_mapping(mapping_path)
     if dtd_path.exists():
-        order_map = _parse_dtd_structure(dtd_path)
-        root_name = None
+        attr_map = _parse_dtd_attlist(dtd_path)
+        if not order_map:
+            order_map = _parse_dtd_structure(dtd_path)
+        dtd_root_name = None
         for key in order_map.keys():
             if _normalize_key(key) == "ectd":
-                root_name = key
+                dtd_root_name = key
                 break
-        if root_name:
-            for child in order_map.get(root_name, []):
+        if dtd_root_name:
+            new_order: list[str] = []
+            for child in order_map.get(dtd_root_name, []):
                 norm = _normalize_key(child)
                 for mk in module_map.keys():
                     if norm.startswith(mk):
                         module_map[mk] = child
+                        new_order.append(mk)
                         break
+            if new_order:
+                seen = set(new_order)
+                module_order = new_order + [mk for mk in module_order if mk not in seen]
 
     def _new_leaf_id() -> str:
         return f"N{uuid.uuid4().hex}"
@@ -948,12 +1268,25 @@ def create_index_xml(
 
     node_cache: dict[tuple[int, str], etree._Element] = {}
 
-    def _ensure_child(parent, tag_name: str):
-        key = (id(parent), tag_name)
+    def _ensure_child(parent, tag_name: str, attrib: dict[str, str] | None = None):
+        attrib = attrib or {}
+        norm_attrib = {_normalize_attr_name(k): v for k, v in attrib.items()}
+        key = (id(parent), tag_name, tuple(sorted(norm_attrib.items())))
         if key in node_cache:
             return node_cache[key]
+        for child in parent:
+            if child.tag != tag_name:
+                continue
+            if norm_attrib:
+                if all(child.get(k) == v for k, v in norm_attrib.items()):
+                    node_cache[key] = child
+                    return child
+            else:
+                if not child.attrib:
+                    node_cache[key] = child
+                    return child
         order = _order_for_parent(order_map, parent.tag)
-        child = etree.Element(tag_name)
+        child = etree.Element(tag_name, attrib=norm_attrib)
         if order:
             index = 0
             for name in order:
@@ -967,6 +1300,67 @@ def create_index_xml(
             parent.append(child)
         node_cache[key] = child
         return child
+
+    def _ensure_path_by_tags(parent, tags: list[str], last_attrib: dict[str, str] | None = None):
+        cur = parent
+        for idx, tag in enumerate(tags):
+            if last_attrib and idx == len(tags) - 1:
+                cur = _ensure_child(cur, tag, attrib=last_attrib)
+            else:
+                cur = _ensure_child(cur, tag)
+        return cur
+
+    def _tags_from_mapping(module_tag: str, file_path: str, is_dir_path: bool) -> list[str]:
+        if not dir_mapping_index and not file_mapping_index:
+            return []
+        tags: list[str] = []
+        cur = module_tag.split("}", 1)[-1]
+        parts = [p for p in file_path.split("/") if p]
+        dir_parts = parts if is_dir_path else parts[:-1]
+        if dir_mapping_index:
+            for i in range(2, len(dir_parts) + 1):
+                prefix = "/".join(dir_parts[:i])
+                tag = _match_mapping_tag(prefix, dir_mapping_index)
+                if not tag:
+                    continue
+                if tag == cur:
+                    continue
+                if tags and tag == tags[-1]:
+                    continue
+                tags.append(tag)
+                cur = tag
+        if not is_dir_path and file_mapping_index:
+            tag = _match_mapping_tag(file_path, file_mapping_index)
+            if tag and tag != cur:
+                tags.append(tag)
+        return tags
+
+    def _tags_from_order(module_tag: str, file_path: str, is_dir_path: bool, module_key: str) -> list[str]:
+        parts = [p for p in file_path.split("/") if p]
+        segs = parts[1:] if is_dir_path else parts[1:-1]
+        tags: list[str] = []
+        cur_tag = module_tag
+        for seg in segs:
+            order = _order_for_parent(order_map, cur_tag)
+            if not order:
+                continue
+            match = _match_child(order, seg, module_key)
+            if not match:
+                continue
+            tags.append(match)
+            cur_tag = match
+        return tags
+
+    def _tags_for_row(module_tag: str, file_path: str, ctd_toc: str, is_dir_path: bool, module_key: str) -> list[str]:
+        if ctd_toc:
+            if order_map:
+                path = _find_path_to_tag(order_map, module_tag, ctd_toc)
+                if path:
+                    return path[1:] if len(path) > 1 else []
+            return [ctd_toc] if ctd_toc != module_tag.split("}", 1)[-1] else []
+        if dir_mapping_index or file_mapping_index:
+            return _tags_from_mapping(module_tag, file_path, is_dir_path)
+        return _tags_from_order(module_tag, file_path, is_dir_path, module_key)
 
     def _ensure_path(parent, path_parts: list[str], module_key: str):
         cur = parent
@@ -1032,50 +1426,118 @@ def create_index_xml(
             "operation": "new",
         })
 
-    for module_key in ("m1", "m2", "m3", "m4", "m5"):
+    for module_key in module_order:
         rows = rows_by_module.get(module_key) or []
         if not rows:
             continue
         module_elem = _ensure_child(root, module_map[module_key])
+        dir_infos: list[dict[str, object]] = []
+        dir_rows = []
+        for row in rows:
+            file_path = (row.get("file_path") or "").strip()
+            if not file_path:
+                continue
+            is_dir_path = _is_directory_path(seq_dir, file_path)
+            if not is_dir_path:
+                continue
+            dir_rows.append(row)
+        if dir_rows:
+            dir_rows.sort(
+                key=lambda r: len([p for p in (r.get("file_path") or "").strip("/").split("/") if p])
+            )
+        for row in dir_rows:
+            file_path = (row.get("file_path") or "").strip()
+            custom_attrs = _parse_custom_attributes(row.get("attributes") or "")
+            if not custom_attrs:
+                continue
+            ctd_toc = (row.get("CTD-TOC") or row.get("ctd_toc") or row.get("ctd-toc") or "").strip()
+            tags = _tags_for_row(module_elem.tag, file_path, ctd_toc, True, module_key)
+            target_tag = tags[-1] if tags else module_elem.tag
+            allowed_attrs = _allowed_attrs_for_element(attr_map, target_tag)
+            filtered_attrs = _filter_allowed_attrs(
+                custom_attrs,
+                allowed_attrs,
+                file_path,
+                target_tag,
+            )
+            dir_parts = [p for p in file_path.strip("/").split("/") if p]
+            base_elem = module_elem
+            remaining_tags = tags[:]
+            for info in dir_infos:
+                parts = info["parts"]
+                if len(parts) <= len(dir_parts) and dir_parts[: len(parts)] == parts:
+                    dir_tags = info["tags"]
+                    if tags[: len(dir_tags)] == dir_tags:
+                        base_elem = info["elem"]
+                        remaining_tags = tags[len(dir_tags):]
+                        break
+            if not remaining_tags:
+                for k, v in filtered_attrs.items():
+                    base_elem.set(_normalize_attr_name(k), v)
+                dir_elem = base_elem
+            else:
+                last_attrib = {_normalize_attr_name(k): v for k, v in filtered_attrs.items()}
+                dir_elem = _ensure_path_by_tags(base_elem, remaining_tags, last_attrib=last_attrib)
+            dir_infos.append({"parts": dir_parts, "tags": tags, "elem": dir_elem})
+        if dir_infos:
+            dir_infos.sort(key=lambda d: len(d["parts"]), reverse=True)
         for row in rows:
             file_path = (row.get("file_path") or "").strip()
             if not file_path:
                 continue
             ctd_toc = (row.get("CTD-TOC") or row.get("ctd_toc") or row.get("ctd-toc") or "").strip()
-            path_parts = file_path.split("/")
-            toc_parent = module_elem
-            if len(path_parts) > 2:
-                dir_parts = path_parts[:-1]
-                if ctd_toc:
-                    if order_map:
-                        path = _find_path_to_tag(order_map, module_elem.tag, ctd_toc)
-                        if path and len(path) > 1:
-                            for tag in path[1:]:
-                                toc_parent = _ensure_child(toc_parent, tag)
-                        elif not path:
-                            if ctd_toc != toc_parent.tag.split("}", 1)[-1]:
-                                toc_parent = _ensure_child(toc_parent, ctd_toc)
+            custom_attrs = _parse_custom_attributes(row.get("attributes") or "")
+            is_dir_path = _is_directory_path(seq_dir, file_path)
+            file_parts = [p for p in file_path.strip("/").split("/") if p]
+            tags = _tags_for_row(module_elem.tag, file_path, ctd_toc, is_dir_path, module_key)
+            base_elem = module_elem
+            remaining_tags = tags[:]
+            for info in dir_infos:
+                parts = info["parts"]
+                if len(parts) <= len(file_parts) and file_parts[: len(parts)] == parts:
+                    dir_tags = info["tags"]
+                    if tags[: len(dir_tags)] == dir_tags:
+                        base_elem = info["elem"]
+                        remaining_tags = tags[len(dir_tags):]
+                        break
+            toc_parent = _ensure_path_by_tags(base_elem, remaining_tags)
+            if custom_attrs:
+                allowed_attrs = _allowed_attrs_for_element(attr_map, toc_parent.tag)
+                filtered_attrs = _filter_allowed_attrs(
+                    custom_attrs,
+                    allowed_attrs,
+                    file_path,
+                    toc_parent.tag,
+                )
+                if filtered_attrs:
+                    merged = dict(toc_parent.attrib)
+                    for k, v in filtered_attrs.items():
+                        merged[_normalize_attr_name(k)] = v
+                    parent = toc_parent.getparent()
+                    if parent is None:
+                        for k, v in merged.items():
+                            toc_parent.set(k, v)
                     else:
-                        if ctd_toc != toc_parent.tag.split("}", 1)[-1]:
-                            toc_parent = _ensure_child(toc_parent, ctd_toc)
-                elif dir_mapping_index or file_mapping_index:
-                    toc_parent = _ensure_path_from_mapping(module_elem, dir_parts)
-                    match_tag = _match_mapping_tag(file_path, file_mapping_index) if file_mapping_index else None
-                    if match_tag and match_tag != toc_parent.tag.split("}", 1)[-1]:
-                        toc_parent = _ensure_child(toc_parent, match_tag)
-                else:
-                    toc_parent = _ensure_path(module_elem, path_parts[1:-1], module_key)
-            _add_leaf(toc_parent, row, file_path)
+                        toc_parent = _ensure_child(parent, toc_parent.tag, attrib=merged)
+            if not is_dir_path:
+                _add_leaf(toc_parent, row, file_path)
 
     xml_path = seq_dir / "index.xml"
+    if xsl_path is None:
+        xsl_path = (UTIL_STYLE_DIR / ICH_XSL_FILENAME).as_posix()
+    doctype = _build_doctype(
+        root_name,
+        (UTIL_DTD_DIR / ICH_DTD_FILENAME).as_posix(),
+        dtd_info.get("public_id") or "",
+    )
     write_xml_with_doctype_and_xsl(
         xml_path,
         root,
-        '<!DOCTYPE ectd:ectd SYSTEM "util/dtd/ich-ectd-3-2.dtd">',
-        "util/style/ectd-2-0.xsl",
+        doctype,
+        xsl_path,
     )
 
-    validate_xml(xml_path, seq_dir / "util" / "dtd" / "ich-ectd-3-2.dtd")
+    validate_xml(xml_path, seq_dir / UTIL_DTD_DIR / ICH_DTD_FILENAME)
 
 # =========================================================
 
@@ -1084,6 +1546,7 @@ def create_eu_regional_xml(
     metadata_rows: list[dict],
     sequence_num: str,
     eu_mapping_path: Path | None = None,
+    xsl_path: str | None = None,
 ) -> Path | None:
     """Build eu-regional.xml (EU M1 3.1) and map EU files into proper sections."""
     eu_rows: list[dict] = []
@@ -1109,12 +1572,18 @@ def create_eu_regional_xml(
     if not eu_rows:
         return None
 
-    NS_EU = "http://europa.eu.int"
-    XLINK = "http://www.w3c.org/1999/xlink"
+    dtd_info = _load_eu_dtd_info(seq_dir)
+    dtd_path = seq_dir / UTIL_DTD_DIR / EU_DTD_FILENAME
+    attr_map = _parse_dtd_attlist(dtd_path) if dtd_path.exists() else {}
+    root_name = dtd_info.get("root_name") or "eu:eu-backbone"
+    NS_EU = dtd_info.get("ns_eu") or EU_NS_DEFAULT
+    XLINK = dtd_info.get("ns_xlink") or XLINK_NS_CANONICAL
+    dtd_version = dtd_info.get("dtd_version") or "3.1"
+    root_prefix, root_local = root_name.split(":", 1) if ":" in root_name else ("eu", root_name)
     root = etree.Element(
-        "{%s}eu-backbone" % NS_EU,
-        nsmap={"eu": NS_EU, "xlink": XLINK},
-        attrib={"dtd-version": "3.1"}
+        "{%s}%s" % (NS_EU, root_local),
+        nsmap={root_prefix: NS_EU, "xlink": XLINK},
+        attrib={"dtd-version": dtd_version}
     )
     dir_mapping_index: dict[int, list[dict]] = {}
     file_mapping_index: dict[int, list[dict]] = {}
@@ -1129,6 +1598,12 @@ def create_eu_regional_xml(
             if val:
                 return val
         return default
+
+    def _validated_value(keys, allowed, default):
+        value = _first_value(keys, default)
+        if allowed and value not in allowed:
+            return default
+        return value
 
     def _new_leaf_id() -> str:
         return f"N{uuid.uuid4().hex}"
@@ -1197,21 +1672,27 @@ def create_eu_regional_xml(
             parent.append(new_elem)
         return new_elem
 
-    countries = {
+    countries = dtd_info.get("countries") or {
         "at", "be", "bg", "common", "cy", "cz", "de", "dk", "edqm", "ee", "el", "es", "ema",
         "fi", "fr", "hr", "hu", "ie", "is", "it", "li", "lt", "lu", "lv", "mt", "nl", "no",
         "pl", "pt", "ro", "se", "si", "sk", "uk", "xi",
     }
-    languages = {
+    languages = dtd_info.get("languages") or {
         "bg", "cs", "da", "de", "el", "en", "es", "et", "fi", "fr", "ga", "hr", "hu", "is",
         "it", "lt", "lv", "mt", "nl", "no", "pl", "pt", "ro", "sk", "sl", "sv",
     }
-    pi_types = {"spc", "annex2", "outer", "interpack", "impack", "other", "pl", "combined"}
+    pi_types = dtd_info.get("pi_types") or {"spc", "annex2", "outer", "interpack", "impack", "other", "pl", "combined"}
+    env_countries = dtd_info.get("env_countries") or countries
+    submission_types = dtd_info.get("submission_types") or set()
+    submission_modes = dtd_info.get("submission_modes") or set()
+    submission_unit_types = dtd_info.get("submission_unit_types") or set()
+    agency_codes = dtd_info.get("agency_codes") or set()
+    procedure_types = dtd_info.get("procedure_types") or set()
 
     eu_envelope = etree.SubElement(root, "eu-envelope")
-    env_country = _first_value(["eu_country"], "at")
-    if env_country not in countries:
-        env_country = "at"
+    env_country = _validated_value(["eu_country"], env_countries, EU_DEFAULTS["env_country"])
+    if env_country not in env_countries:
+        env_country = EU_DEFAULTS["env_country"]
     envelope = etree.SubElement(eu_envelope, "envelope", attrib={"country": env_country})
     etree.SubElement(envelope, "identifier").text = _first_value(["eu_identifier"], str(uuid.uuid4()))
 
@@ -1219,34 +1700,53 @@ def create_eu_regional_xml(
         envelope,
         "submission",
         attrib={
-            "type": _first_value(["eu_submission_type"], "none"),
-            "mode": _first_value(["eu_submission_mode"], "single"),
+            "type": _validated_value(["eu_submission_type"], submission_types, EU_DEFAULTS["submission_type"]),
+            "mode": _validated_value(["eu_submission_mode"], submission_modes, EU_DEFAULTS["submission_mode"]),
         },
     )
     submission_number = _first_value(["eu_submission_number"], "")
     if submission_number:
         etree.SubElement(submission, "number").text = submission_number
     proc_tracking = etree.SubElement(submission, "procedure-tracking")
-    etree.SubElement(proc_tracking, "number").text = _first_value(["eu_procedure_number"], "1")
+    etree.SubElement(proc_tracking, "number").text = _first_value(
+        ["eu_procedure_number"],
+        EU_DEFAULTS["procedure_number"],
+    )
 
     etree.SubElement(
         envelope,
         "submission-unit",
-        attrib={"type": _first_value(["eu_submission_unit_type"], "initial")},
+        attrib={"type": _validated_value(
+            ["eu_submission_unit_type"],
+            submission_unit_types,
+            EU_DEFAULTS["submission_unit_type"],
+        )},
     )
-    etree.SubElement(envelope, "applicant").text = _first_value(["applicant_name"], "Unknown applicant")
+    etree.SubElement(envelope, "applicant").text = _first_value(
+        ["applicant_name"],
+        EU_DEFAULTS["applicant_name"],
+    )
     etree.SubElement(
         envelope,
         "agency",
-        attrib={"code": _first_value(["eu_agency_code"], "EU-EMA")},
+        attrib={"code": _validated_value(
+            ["eu_agency_code"],
+            agency_codes,
+            EU_DEFAULTS["agency_code"],
+        )},
     )
     etree.SubElement(
         envelope,
         "procedure",
-        attrib={"type": _first_value(["eu_procedure_type"], "national")},
+        attrib={"type": _validated_value(
+            ["eu_procedure_type"],
+            procedure_types,
+            EU_DEFAULTS["procedure_type"],
+        )},
     )
     etree.SubElement(envelope, "invented-name").text = _first_value(
-        ["eu_invented_name"], "Unknown product"
+        ["eu_invented_name"],
+        EU_DEFAULTS["invented_name"],
     )
     inn_value = _first_value(["eu_inn"], "")
     if inn_value:
@@ -1256,11 +1756,12 @@ def create_eu_regional_xml(
         ["eu_related_sequence"], sequence_num
     )
     etree.SubElement(envelope, "submission-description").text = _first_value(
-        ["sequence_description"], "Not provided"
+        ["sequence_description"],
+        EU_DEFAULTS["submission_description"],
     )
 
     m1_eu = etree.SubElement(root, "m1-eu")
-    m1_order = [
+    m1_order = dtd_info.get("m1_order") or [
         "m1-0-cover",
         "m1-2-form",
         "m1-3-pi",
@@ -1275,7 +1776,7 @@ def create_eu_regional_xml(
         "m1-additional-data",
     ]
     m1_order_map = {tag: idx for idx, tag in enumerate(m1_order)}
-    child_order_maps = {
+    child_order_maps = dtd_info.get("child_order_maps") or {
         "m1-3-pi": {
             "m1-3-1-spc-label-pl": 0,
             "m1-3-2-mockup": 1,
@@ -1382,6 +1883,14 @@ def create_eu_regional_xml(
         return "m1-additional-data", None, "specific"
 
     def _container_type_for_section(section_tag: str) -> str:
+        order_map = dtd_info.get("order_map")
+        if order_map and section_tag in order_map:
+            children = order_map[section_tag]
+            if "specific" in children:
+                return "specific"
+            if "pi-doc" in children:
+                return "pi-doc"
+            return "leaf"
         if section_tag in {
             "m1-0-cover",
             "m1-2-form",
@@ -1417,8 +1926,16 @@ def create_eu_regional_xml(
         child_tag = tags[1] if len(tags) > 1 else None
         return section_tag, child_tag
 
+    dir_infos: list[dict[str, object]] = []
     for row in eu_rows:
         file_path = (row.get("file_path") or "").strip()
+        if not file_path:
+            continue
+        if not _is_directory_path(seq_dir, file_path):
+            continue
+        custom_attrs = _parse_custom_attributes(row.get("attributes") or "")
+        if not custom_attrs:
+            continue
         rel_path = file_path[len("m1/eu/"):]
         parts = [p for p in rel_path.split("/") if p]
         if not parts:
@@ -1444,9 +1961,9 @@ def create_eu_regional_xml(
                 country = "common"
             container = _ensure_child(section_elem, "specific", {"country": country})
         elif container_type == "pi-doc":
-            pi_country = _find_token(parts, countries, "common")
-            pi_lang = _find_token(parts, languages, "en")
-            pi_type = _find_token(parts, pi_types, "other")
+            pi_country = _find_token(parts, countries, EU_DEFAULTS["pi_country"])
+            pi_lang = _find_token(parts, languages, EU_DEFAULTS["pi_lang"])
+            pi_type = _find_token(parts, pi_types, EU_DEFAULTS["pi_type"])
             container = _ensure_child(
                 section_elem,
                 "pi-doc",
@@ -1455,20 +1972,117 @@ def create_eu_regional_xml(
         else:
             container = section_elem
 
-        _add_leaf(container, row, file_path, rel_path)
+        allowed_attrs = _allowed_attrs_for_element(attr_map, container.tag)
+        filtered_attrs = _filter_allowed_attrs(
+            custom_attrs,
+            allowed_attrs,
+            file_path,
+            container.tag,
+        )
+        if filtered_attrs:
+            merged = dict(container.attrib)
+            for k, v in filtered_attrs.items():
+                merged[_normalize_attr_name(k)] = v
+            parent = container.getparent()
+            if parent is not None:
+                container = _ensure_child(parent, container.tag, attrib=merged)
+            else:
+                for k, v in merged.items():
+                    container.set(k, v)
+
+        dir_parts = [p for p in file_path.strip("/").split("/") if p]
+        dir_infos.append({"parts": dir_parts, "elem": container})
+
+    if dir_infos:
+        dir_infos.sort(key=lambda d: len(d["parts"]), reverse=True)
+
+    for row in eu_rows:
+        file_path = (row.get("file_path") or "").strip()
+        rel_path = file_path[len("m1/eu/"):]
+        parts = [p for p in rel_path.split("/") if p]
+        if not parts:
+            continue
+        custom_attrs = _parse_custom_attributes(row.get("attributes") or "")
+        is_dir_path = _is_directory_path(seq_dir, file_path)
+
+        file_parts = [p for p in file_path.strip("/").split("/") if p]
+        container = None
+        for info in dir_infos:
+            parts_prefix = info["parts"]
+            if len(parts_prefix) <= len(file_parts) and file_parts[: len(parts_prefix)] == parts_prefix:
+                container = info["elem"]
+                break
+        if container is None:
+            section_tag, child_tag = _mapped_section_tags(file_path)
+            if not section_tag:
+                section = parts[0]
+                section_tag, child_tag, container_type = _map_m1_section(section, parts)
+            else:
+                container_type = _container_type_for_section(section_tag)
+            section_elem = _ensure_child(m1_eu, section_tag, order_map=m1_order_map)
+            if child_tag:
+                section_elem = _ensure_child(
+                    section_elem,
+                    child_tag,
+                    order_map=child_order_maps.get(section_tag),
+                )
+
+            if container_type == "specific":
+                country = parts[1] if len(parts) > 1 else "common"
+                if country not in countries:
+                    country = "common"
+                container = _ensure_child(section_elem, "specific", {"country": country})
+            elif container_type == "pi-doc":
+                pi_country = _find_token(parts, countries, EU_DEFAULTS["pi_country"])
+                pi_lang = _find_token(parts, languages, EU_DEFAULTS["pi_lang"])
+                pi_type = _find_token(parts, pi_types, EU_DEFAULTS["pi_type"])
+                container = _ensure_child(
+                    section_elem,
+                    "pi-doc",
+                    {"country": pi_country, "type": pi_type, "{http://www.w3.org/XML/1998/namespace}lang": pi_lang},
+                )
+            else:
+                container = section_elem
+        if custom_attrs:
+            allowed_attrs = _allowed_attrs_for_element(attr_map, container.tag)
+            filtered_attrs = _filter_allowed_attrs(
+                custom_attrs,
+                allowed_attrs,
+                file_path,
+                container.tag,
+            )
+            if filtered_attrs:
+                merged = dict(container.attrib)
+                for k, v in filtered_attrs.items():
+                    merged[_normalize_attr_name(k)] = v
+                parent = container.getparent()
+                if parent is not None:
+                    container = _ensure_child(parent, container.tag, attrib=merged)
+                else:
+                    for k, v in merged.items():
+                        container.set(k, v)
+
+        if not is_dir_path:
+            _add_leaf(container, row, file_path, rel_path)
 
     m1_eu_dir = seq_dir / "m1" / "eu"
     m1_eu_dir.mkdir(parents=True, exist_ok=True)
     xml_path = m1_eu_dir / "eu-regional.xml"
 
+    if xsl_path is None:
+        xsl_path = (UTIL_STYLE_DIR / EU_XSL_FILENAME).as_posix()
+    doctype = _build_doctype(
+        root_name,
+        (Path("..") / ".." / UTIL_DTD_DIR / EU_DTD_FILENAME).as_posix(),
+        dtd_info.get("public_id") or "",
+    )
     write_xml_with_doctype_and_xsl(
         xml_path,
         root,
-        '<!DOCTYPE eu:eu-backbone SYSTEM "../../util/dtd/eu-regional.dtd">',
-        "../../util/style/eu-regional.xsl",
+        doctype,
+        xsl_path,
     )
 
-    dtd_path = seq_dir / "util" / "dtd" / "eu-regional.dtd"
     if dtd_path.exists():
         validate_xml(xml_path, dtd_path)
     else:
@@ -1486,6 +2100,8 @@ def main(
     mapfile: str | None = None,
     extract_xml: bool = False,
     eu_mapfile: str | None = None,
+    xsl_path: str | None = None,
+    eu_xsl_path: str | None = None,
 ):
     base = Path(base_dir)
     seq_dir = base / sequence_num
@@ -1518,8 +2134,21 @@ def main(
     seq_int = int(sequence_num)
 
     print(f"Starting backbone generation for sequence {sequence_num} …")
-    create_eu_regional_xml(seq_dir, metadata, sequence_num, eu_mapping_path=eu_mapping_path)
-    create_index_xml(seq_dir, metadata, base, seq_int, mapping_path=mapping_path)
+    create_eu_regional_xml(
+        seq_dir,
+        metadata,
+        sequence_num,
+        eu_mapping_path=eu_mapping_path,
+        xsl_path=eu_xsl_path,
+    )
+    create_index_xml(
+        seq_dir,
+        metadata,
+        base,
+        seq_int,
+        mapping_path=mapping_path,
+        xsl_path=xsl_path,
+    )
     write_index_md5(seq_dir, seq_dir / "index.xml")
     print("✅ All XML backbones created and validated!")
 
@@ -1529,8 +2158,8 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(
         description=(
             "Generate eCTD XML backbones from Excel metadata (metadata-<seq>.xlsx). "
-            "Excel columns must include file_path, title, operation, modified-leaf, modified-href "
-            "and optional ctd-toc (override target XML element tag), "
+            "Excel columns must include file_path, title, attributes (backbone element attrs), "
+            "operation, modified-leaf, modified-href and optional ctd-toc (override target XML element tag), "
             "plus EU envelope fields (eu_country, eu_identifier, eu_submission_type, eu_submission_mode, "
             "eu_submission_number, eu_procedure_number, eu_submission_unit_type, eu_agency_code, "
             "eu_procedure_type, eu_invented_name, eu_inn, eu_related_sequence)."
@@ -1566,6 +2195,16 @@ if __name__ == "__main__":
             "Required columns: item_type (directory|file), relative_path, xml_element."
         ),
     )
+    ap.add_argument(
+        "-xsl",
+        default=None,
+        help="Path to XSL for index.xml (default: util/style/ectd-2-0.xsl).",
+    )
+    ap.add_argument(
+        "-eu_xsl",
+        default=None,
+        help="Path to XSL for eu-regional.xml (default: util/style/eu-regional.xsl).",
+    )
     args = ap.parse_args()
     main(
         args.base_directory,
@@ -1574,4 +2213,6 @@ if __name__ == "__main__":
         mapfile=args.mapfile,
         extract_xml=args.extractXML,
         eu_mapfile=args.eu_mapfile,
+        xsl_path=args.xsl,
+        eu_xsl_path=args.eu_xsl,
     )
