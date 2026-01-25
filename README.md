@@ -25,7 +25,7 @@ python ectd-tool.py <base_directory> <sequence_number> [-scan] [-extractXML] [-m
   `eu_procedure_type`, `eu_invented_name`, `eu_inn`, `eu_related_sequence`
 - Directory rows: set `file_path` to a folder path to apply `attributes` to the backbone element
   for that subtree without creating a leaf (all child files are grouped under that element).
-- You can generate the file with `-scan` and fill missing values from XML with `-extractXML`.
+- You can generate the file with `-scan` and extract metadata from backbone XMLs with `-extractXML`.
 
 #### Mapping files
 - `-mapfile` (default: `ectd_3_2_2_path_to_xml_element_mapping.csv`)
@@ -34,8 +34,10 @@ python ectd-tool.py <base_directory> <sequence_number> [-scan] [-extractXML] [-m
   - CSV columns: `item_type` (`directory|file`), `relative_path`, `xml_element`
 
 #### Extract from XML
-`-extractXML` fills missing metadata cells from `index.xml` and `m1/eu/eu-regional.xml` without
-overwriting existing values. It also populates `attributes` from allowed backbone element attributes.
+`-extractXML` reads `index.xml` and any referenced regional XML files (for example
+`m1/eu/eu-regional.xml`) and transfers the information into `metadata-<seq>.xlsx`.
+It creates rows for every leaf and for every branch that has attributes, and preserves
+the XML order (regional XML content appears where it is referenced in `index.xml`).
 
 ### `ectd-viewer.py`
 GUI viewer for eCTD dossiers (PySide6).
