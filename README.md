@@ -13,11 +13,19 @@ python ectd-tool.py <base_directory> <sequence_number> [-scan] [-extractXML] [-m
 ```
 
 #### Metadata (metadata-\<seq>.xlsx)
+- The tool expects an Excel workbook named `metadata-<seq>.xlsx` in the base directory, with a
+  `metadata` sheet as the first/active sheet.
+- `file_path` values are relative to the sequence directory (for example: `m1/12/cover.pdf`).
 - Required columns: `file_path`, `title`, `operation`, `modified-leaf`, `modified-href`
-- Optional columns: `ctd_toc` (override target XML element tag for a file)
-- EU envelope fields: `eu_country`, `eu_identifier`, `eu_submission_type`, `eu_submission_mode`,
+- Optional columns: `ctd_toc` (override target XML element tag for a file),
+  `attributes` (backbone element attributes in `key="value"` form)
+- EU envelope fields: `applicant_name`, `submission_type`, `sequence_description`,
+  `eu_country`, `eu_identifier`, `eu_submission_type`, `eu_submission_mode`,
   `eu_submission_number`, `eu_procedure_number`, `eu_submission_unit_type`, `eu_agency_code`,
   `eu_procedure_type`, `eu_invented_name`, `eu_inn`, `eu_related_sequence`
+- Directory rows: set `file_path` to a folder path to apply `attributes` to the backbone element
+  for that subtree without creating a leaf (all child files are grouped under that element).
+- You can generate the file with `-scan` and fill missing values from XML with `-extractXML`.
 
 #### Mapping files
 - `-mapfile` (default: `ectd_3_2_2_path_to_xml_element_mapping.csv`)
@@ -27,7 +35,7 @@ python ectd-tool.py <base_directory> <sequence_number> [-scan] [-extractXML] [-m
 
 #### Extract from XML
 `-extractXML` fills missing metadata cells from `index.xml` and `m1/eu/eu-regional.xml` without
-overwriting existing values.
+overwriting existing values. It also populates `attributes` from allowed backbone element attributes.
 
 ### `ectd-viewer.py`
 GUI viewer for eCTD dossiers (PySide6).

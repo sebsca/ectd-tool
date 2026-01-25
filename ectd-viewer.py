@@ -156,6 +156,53 @@ def derive_toc_label(elem: ET.Element) -> str:
     return tag
 
 
+def derive_toc_label_m1(elem: ET.Element) -> str:
+    tag = localname(elem.tag)
+    if tag == "specific":
+        country = elem.attrib.get("country") or elem.attrib.get("Country")
+        if country:
+            return country
+        if elem.attrib:
+            return next(iter(elem.attrib.values()))
+    return derive_toc_label(elem)
+
+
+def derive_toc_labels_m1(elem: ET.Element) -> List[str]:
+    tag = localname(elem.tag)
+    if tag == "pi-doc":
+        lang = (
+            elem.attrib.get("{http://www.w3.org/XML/1998/namespace}lang")
+            or elem.attrib.get("xml:lang")
+            or elem.attrib.get("lang")
+        )
+        pi_type = elem.attrib.get("type")
+        country = elem.attrib.get("country")
+        labels = []
+        if lang:
+            labels.append(lang)
+        if pi_type:
+            labels.append(pi_type)
+        if country:
+            labels.append(country)
+        if labels:
+            return labels
+    return [derive_toc_label_m1(elem)]
+
+
+def derive_toc_labels(elem: ET.Element, module_key: Optional[str]) -> List[str]:
+    if module_key == "m1":
+        return derive_toc_labels_m1(elem)
+    if elem.attrib:
+        tag = localname(elem.tag)
+        parts = []
+        for key, value in sorted(elem.attrib.items(), key=lambda kv: localname(kv[0])):
+            attr_name = localname(key)
+            parts.append(f"{attr_name}={value}")
+        attr_text = ", ".join(parts)
+        return [f"{tag} ({attr_text})"]
+    return [derive_toc_label(elem)]
+
+
 @dataclass(eq=False)
 class BackboneFile:
     sequence: str
@@ -348,9 +395,15 @@ class EctdDossier:
                             abs_file = (xml_path.parent / Path(href_path)).resolve()
 
                         toc_labels: List[str] = []
+                        module_key = None
                         if len(stack) >= 2:
                             for anc in stack[1:-1]:
-                                toc_labels.append(derive_toc_label(anc))
+                                if module_key is None:
+                                    anc_name = localname(anc.tag).lower()
+                                    m = re.match(r"m[1-5]", anc_name)
+                                    if m:
+                                        module_key = m.group(0)
+                                toc_labels.extend(derive_toc_labels(anc, module_key))
 
                         leaf_xml = element_outer_xml(elem)
                         attrib_prefixed = {to_prefixed_name(k, uri_to_prefix): v for k, v in (elem.attrib or {}).items()}
