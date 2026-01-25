@@ -2,7 +2,6 @@
 """
 ema_ectd_backbone_generator.py
 Generates and validates eCTD 3.2 and EU M1 3.1 compliant XML backbones.
-Version 1.0
 """
 
 import os
@@ -10,14 +9,76 @@ import re
 import csv
 import uuid
 import hashlib
+import logging
+import sys
+import posixpath
+from functools import lru_cache
 from pathlib import Path
+from typing import TypedDict, Optional
 from lxml import etree
 
 __version__ = "0.1.0"
 
+# Configure logging
+logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s: %(message)s"
+)
+
 # =========================================================
-# Utility functions
+# Custom Exceptions
 # =========================================================
+
+class MetadataError(Exception):
+    """Raised when metadata is invalid or incomplete."""
+    pass
+
+class XMLValidationError(Exception):
+    """Raised when XML validation fails."""
+    pass
+
+class DependencyError(Exception):
+    """Raised when required dependency is missing."""
+    pass
+
+# =========================================================
+# Type Definitions
+# =========================================================
+
+class MetadataRow(TypedDict, total=False):
+    """Metadata row from Excel sheet."""
+    file_path: str
+    title: str
+    attributes: str
+    operation: str
+    modified_leaf: str
+    modified_href: str
+    modified_file: str
+    ctd_toc: str
+    applicant_name: str
+    submission_type: str
+    sequence_description: str
+    eu_country: str
+    eu_identifier: str
+    eu_submission_type: str
+    eu_submission_mode: str
+    eu_submission_number: str
+    eu_procedure_number: str
+    eu_submission_unit_type: str
+    eu_agency_code: str
+    eu_procedure_type: str
+    eu_invented_name: str
+    eu_inn: str
+    eu_related_sequence: str
+
+# =========================================================
+# Constants
+# =========================================================
+
+EMPTY_FILE_CHECKSUM = "d41d8cd98f00b204e9800998ecf8427e"  # MD5 of empty file
+DEFAULT_DTD_DIR = Path("util") / "dtd"
+DEFAULT_STYLE_DIR = Path("util") / "style"
 
 XLINK_NS_CANONICAL = "http://www.w3.org/1999/xlink"
 XLINK_NS_LEGACY = "http://www.w3c.org/1999/xlink"
@@ -51,7 +112,65 @@ EU_DEFAULTS = {
     "pi_type": "other",
 }
 
+# =========================================================
+# Utility Classes
+# =========================================================
+
+class PathNormalizer:
+    """Consistent path normalization across the codebase."""
+    
+    @staticmethod
+    def normalize(path: str) -> str:
+        """
+        Normalize a path string for consistent comparison.
+        
+        Args:
+            path: Input path string (may contain backslashes, whitespace)
+            
+        Returns:
+            Normalized path with forward slashes and stripped whitespace
+        """
+        return (path or "").strip().replace("\\", "/")
+
+
+# =========================================================
+# Utility Functions
+# =========================================================
+
+def _check_dependencies() -> None:
+    """
+    Verify that required packages are installed.
+    
+    Raises:
+        DependencyError: If any required package is missing
+    """
+    try:
+        import openpyxl
+    except ImportError as e:
+        raise DependencyError(
+            "openpyxl is required to read/write Excel metadata. "
+            "Install it with: pip install openpyxl"
+        ) from e
+    
+    try:
+        from lxml import etree
+    except ImportError as e:
+        raise DependencyError(
+            "lxml is required for XML processing. "
+            "Install it with: pip install lxml"
+        ) from e
+
+
 def md5_checksum(filepath: Path) -> str:
+    """
+    Compute MD5 checksum of a file.
+    
+    Args:
+        filepath: Path to file to checksum
+        
+    Returns:
+        Hexadecimal MD5 hash string
+    """
     m = hashlib.md5()
     with open(filepath, "rb") as f:
         for chunk in iter(lambda: f.read(4096), b""):
@@ -88,16 +207,18 @@ def checksum_for_path(seq_dir: Path, file_path: str) -> tuple[str, bool]:
     file_abs = seq_dir / file_path
     if not file_abs.exists():
         if not file_abs.parent.exists():
-            print(f"⚠ Missing directory for leaf: {file_abs.parent}")
-        print(f"⚠ Missing file for leaf: {file_path}")
+            logger.warning(f"Missing directory for leaf: {file_abs.parent}")
+        logger.warning(f"Missing file for leaf: {file_path}")
         return "", False
     if file_abs.is_dir():
-        print(f"⚠ Skipping checksum for directory path: {file_path}")
+        logger.warning(f"Skipping checksum for directory path: {file_path}")
         return "", False
     return md5_checksum(file_abs), True
 
 def write_xml_with_doctype_and_xsl(xml_path: Path, root, doctype: str, xsl_href: str) -> None:
     """Write XML with a DOCTYPE and xml-stylesheet PI."""
+    if xml_path.exists() and not _confirm_overwrite(xml_path):
+        return
     etree.indent(root, space="  ")
     body = etree.tostring(root, encoding="utf-8", xml_declaration=False)
     header = b'<?xml version="1.0" encoding="utf-8"?>\n'
@@ -116,7 +237,48 @@ def write_index_md5(seq_dir: Path, index_path: Path) -> None:
     checksum = md5_checksum(index_path)
     rel = index_path.relative_to(seq_dir).as_posix()
     out_path = seq_dir / "index-md5.txt"
+    if out_path.exists() and not _confirm_overwrite(out_path):
+        return
     out_path.write_text(f"{checksum}  {rel}\n", encoding="utf-8")
+
+_confirmed_overwrites: set[Path] = set()
+
+def _confirm_overwrite(path: Path) -> bool:
+    """Ask for confirmation before overwriting an existing file."""
+    if not path.exists():
+        return True
+    resolved = path.resolve()
+    if resolved in _confirmed_overwrites:
+        return True
+    if not sys.stdin or not sys.stdin.isatty():
+        logger.error(f"Refusing to overwrite without a TTY prompt: {path}")
+        return False
+    answer = input(f"{path} exists. Overwrite? [Y/n]: ").strip().lower()
+    if answer in {"", "y", "yes"}:
+        _confirmed_overwrites.add(resolved)
+        return True
+    logger.info(f"Skipped overwriting: {path}")
+    return False
+
+def _confirm_metadata_write(path: Path) -> bool:
+    """Ask before creating or overwriting the metadata Excel file."""
+    if path.exists():
+        return _confirm_overwrite(path)
+    if not sys.stdin or not sys.stdin.isatty():
+        return True
+    answer = input(f"{path} does not exist. Create it? [Y/n]: ").strip().lower()
+    if answer in {"", "y", "yes"}:
+        return True
+    logger.info(f"Skipped creating metadata file: {path}")
+    return False
+
+def _select_metadata_sheet(wb, sheet_name: str | None = None):
+    """Prefer a sheet named 'metadata' when available, otherwise use the active sheet."""
+    if sheet_name:
+        return wb[sheet_name]
+    if "metadata" in wb.sheetnames:
+        return wb["metadata"]
+    return wb.active
 
 def resolve_previous_leaf_ref(
     base_dir: Path,
@@ -135,23 +297,45 @@ def resolve_previous_leaf_ref(
         return find_previous_leaf_id(base_dir, seq_num, fallback_paths)
     return find_previous_leaf_id(base_dir, seq_num, [file_path])
 
-def load_metadata(xlsx_path: Path, sheet_name: str | None = None) -> list[dict]:
+def load_metadata(xlsx_path: Path, sheet_name: str | None = None, strict: bool = False) -> list[dict]:
+    """
+    Load metadata from Excel file.
+    
+    Args:
+        xlsx_path: Path to Excel metadata file
+        sheet_name: Specific sheet name to load (defaults to 'metadata' if present)
+        strict: If True, validate that all required columns are present
+        
+    Returns:
+        List of metadata row dictionaries
+        
+    Raises:
+        MetadataError: If strict=True and required columns are missing
+    """
     try:
         import openpyxl
     except ImportError as exc:
-        raise ImportError(
+        raise DependencyError(
             "openpyxl is required to read Excel metadata files. "
             "Install it in the current environment."
         ) from exc
 
     wb = openpyxl.load_workbook(xlsx_path, data_only=True)
-    ws = wb[sheet_name] if sheet_name else wb.active
+    ws = _select_metadata_sheet(wb, sheet_name)
 
     rows = list(ws.iter_rows(values_only=True))
     if not rows:
         return []
 
     headers = [str(h).strip() if h is not None else "" for h in rows[0]]
+    
+    # Validate required columns if strict mode
+    if strict:
+        required = {"file_path", "operation", "title"}
+        missing = required - set(headers)
+        if missing:
+            raise MetadataError(f"Missing required columns: {', '.join(missing)}")
+    
     out: list[dict] = []
     for row in rows[1:]:
         if row is None or all(cell is None or str(cell).strip() == "" for cell in row):
@@ -184,13 +368,14 @@ def ensure_metadata_columns(xlsx_path: Path) -> None:
     if not xlsx_path.exists():
         return
     wb = openpyxl.load_workbook(xlsx_path)
-    ws = wb.active
+    ws = _select_metadata_sheet(wb)
     header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
     headers = [str(h).strip() if h is not None else "" for h in (header_row or [])]
     if not any(headers):
         ws.delete_rows(1, ws.max_row)
         ws.append(METADATA_FIELDS)
-        wb.save(xlsx_path)
+        if _confirm_metadata_write(xlsx_path):
+            wb.save(xlsx_path)
         return
     updated = False
     for field in METADATA_FIELDS:
@@ -202,7 +387,8 @@ def ensure_metadata_columns(xlsx_path: Path) -> None:
             ws.cell(row=1, column=len(headers), value=field)
             updated = True
     if updated:
-        wb.save(xlsx_path)
+        if _confirm_metadata_write(xlsx_path):
+            wb.save(xlsx_path)
 
 def write_metadata_from_scan(seq_dir: Path, xlsx_path: Path) -> int:
     """Scan sequence directory and append missing rows to metadata Excel."""
@@ -216,7 +402,7 @@ def write_metadata_from_scan(seq_dir: Path, xlsx_path: Path) -> int:
 
     if xlsx_path.exists():
         wb = openpyxl.load_workbook(xlsx_path)
-        ws = wb.active
+        ws = _select_metadata_sheet(wb)
         rows = list(ws.iter_rows(values_only=True))
         headers = [str(h).strip() if h is not None else "" for h in (rows[0] if rows else [])]
         if not headers or "file_path" not in headers:
@@ -264,8 +450,18 @@ def write_metadata_from_scan(seq_dir: Path, xlsx_path: Path) -> int:
         ws.append([row.get(field, "") for field in METADATA_FIELDS])
         new_rows += 1
 
-    if new_rows > 0 or not xlsx_path.exists():
-        wb.save(xlsx_path)
+    if not xlsx_path.exists():
+        if _confirm_metadata_write(xlsx_path):
+            wb.save(xlsx_path)
+            return new_rows
+        logger.info("Metadata file was not created.")
+        return 0
+    if new_rows > 0:
+        if _confirm_metadata_write(xlsx_path):
+            wb.save(xlsx_path)
+            return new_rows
+        logger.info("Metadata changes were not saved.")
+        return 0
     return new_rows
 
 def extract_eu_envelope_fields(xml_path: Path) -> dict[str, str]:
@@ -354,6 +550,111 @@ def _resolve_modified_href(seq_dir: Path, modified_file: str, cache: dict[Path, 
         cache[xml_path] = id_map
     return cache.get(xml_path, {}).get(leaf_id, "")
 
+def _local_name(tag: str) -> str:
+    """Return the local XML name without namespace."""
+    return tag.split("}", 1)[-1] if tag else ""
+
+def _is_repeated_branch(node) -> bool:
+    """Return True when node has siblings with the same tag (repeated branch)."""
+    parent = node.getparent() if node is not None else None
+    if parent is None:
+        return False
+    node_local = _local_name(node.tag)
+    same_tag = 0
+    for child in parent:
+        if _local_name(getattr(child, "tag", "")) == node_local:
+            same_tag += 1
+            if same_tag > 1:
+                return True
+    return False
+
+def _collect_allowed_attrs(node, attr_map: dict[str, set[str]]) -> dict[str, str]:
+    """Collect allowed attributes for a node based on the DTD attribute map."""
+    if node is None or not getattr(node, "tag", None):
+        return {}
+    allowed = attr_map.get(_local_name(node.tag), set())
+    if not allowed:
+        return {}
+    attrs: dict[str, str] = {}
+    for name in sorted(allowed):
+        if name == "xml:lang":
+            val = node.get("{%s}lang" % XML_NS)
+        else:
+            val = node.get(name)
+        if val:
+            attrs[name] = val
+    return attrs
+
+def _attributes_for_leaf_parent(leaf, attr_map: dict[str, set[str]]) -> dict[str, str]:
+    """Collect only direct parent attributes for a leaf (DTD-safe)."""
+    parent = leaf.getparent()
+    if parent is None:
+        return {}
+    return _collect_allowed_attrs(parent, attr_map)
+
+def _branch_directory_path(node, base_prefix: str | None = None) -> str:
+    """
+    Derive a directory-like path for a repeated branch.
+
+    We compute the common directory across all leaf hrefs in the branch subtree.
+    """
+    leaves = node.xpath(".//*[local-name()='leaf']")
+    hrefs: list[str] = []
+    for leaf in leaves:
+        href = _leaf_href(leaf)
+        if href:
+            hrefs.append(href)
+    if not hrefs:
+        return ""
+    dirs = [posixpath.dirname(h) for h in hrefs if posixpath.dirname(h)]
+    if not dirs:
+        return ""
+    try:
+        common_dir = posixpath.commonpath(dirs)
+    except ValueError:
+        common_dir = dirs[0]
+    if not common_dir:
+        return ""
+    if base_prefix and not common_dir.startswith(base_prefix + "/"):
+        common_dir = f"{base_prefix}/{common_dir}"
+    if not common_dir.endswith("/"):
+        common_dir = common_dir + "/"
+    return common_dir
+
+def _extract_branch_rows_from_xml(
+    xml_path: Path,
+    base_prefix: str | None,
+    attr_map: dict[str, set[str]],
+) -> list[dict[str, str]]:
+    """Extract rows for repeated branches that carry attributes."""
+    if not xml_path.exists():
+        return []
+    xml = etree.parse(xml_path)
+    root = xml.getroot()
+    rows: list[dict[str, str]] = []
+    for node in root.iter():
+        tag = getattr(node, "tag", None)
+        if not tag or _local_name(tag) == "leaf":
+            continue
+        if not _is_repeated_branch(node):
+            continue
+        attrs = _collect_allowed_attrs(node, attr_map)
+        if not attrs:
+            continue
+        branch_path = _branch_directory_path(node, base_prefix)
+        if not branch_path:
+            continue
+        rows.append(
+            {
+                "file_path": branch_path,
+                "title": _local_name(tag),
+                "operation": "new",
+                "ctd_toc": _local_name(tag),
+                "attributes": " ".join(f'{k}="{v}"' for k, v in attrs.items()),
+            }
+        )
+    return rows
+
 def _extract_leaf_rows_from_xml(
     xml_path: Path,
     seq_dir: Path,
@@ -393,21 +694,11 @@ def _extract_leaf_rows_from_xml(
         if include_ctd_toc:
             parent = leaf.getparent()
             if parent is not None and parent.tag:
-                row["ctd_toc"] = parent.tag.split("}", 1)[-1]
+                row["ctd_toc"] = _local_name(parent.tag)
         if attr_map is not None:
-            parent = leaf.getparent()
-            if parent is not None and parent.tag:
-                allowed = attr_map.get(parent.tag.split("}", 1)[-1], set())
-                attrs: dict[str, str] = {}
-                for name in sorted(allowed):
-                    if name == "xml:lang":
-                        val = parent.get("{%s}lang" % XML_NS)
-                    else:
-                        val = parent.get(name)
-                    if val:
-                        attrs[name] = val
-                if attrs:
-                    row["attributes"] = " ".join(f'{k}="{v}"' for k, v in attrs.items())
+            attrs = _attributes_for_leaf_parent(leaf, attr_map)
+            if attrs:
+                row["attributes"] = " ".join(f'{k}="{v}"' for k, v in attrs.items())
         rows.append(row)
     return rows
 
@@ -423,7 +714,7 @@ def extract_metadata_from_xml(seq_dir: Path, xlsx_path: Path) -> tuple[int, int,
 
     if xlsx_path.exists():
         wb = openpyxl.load_workbook(xlsx_path)
-        ws = wb.active
+        ws = _select_metadata_sheet(wb)
     else:
         wb = openpyxl.Workbook()
         ws = wb.active
@@ -444,7 +735,10 @@ def extract_metadata_from_xml(seq_dir: Path, xlsx_path: Path) -> tuple[int, int,
     if "ctd_toc" not in col_idx and "ctd-toc" in col_idx:
         col_idx["ctd_toc"] = col_idx["ctd-toc"]
     file_col = col_idx.get("file_path")
-    existing_by_path: dict[str, int] = {}
+    attr_col = col_idx.get("attributes")
+    toc_col = col_idx.get("ctd_toc")
+    existing_by_key: dict[tuple[str, str, str], int] = {}
+    existing_by_path: dict[str, list[int]] = {}
     if file_col:
         for row_idx in range(2, ws.max_row + 1):
             val = ws.cell(row=row_idx, column=file_col).value
@@ -452,7 +746,17 @@ def extract_metadata_from_xml(seq_dir: Path, xlsx_path: Path) -> tuple[int, int,
                 continue
             key = str(val).strip()
             if key:
-                existing_by_path[_norm_href(key)] = row_idx
+                norm_path = _norm_href(key)
+                attr_val = ""
+                toc_val = ""
+                if attr_col:
+                    cell_val = ws.cell(row=row_idx, column=attr_col).value
+                    attr_val = str(cell_val).strip() if cell_val is not None else ""
+                if toc_col:
+                    cell_val = ws.cell(row=row_idx, column=toc_col).value
+                    toc_val = str(cell_val).strip() if cell_val is not None else ""
+                existing_by_key[(norm_path, attr_val, toc_val)] = row_idx
+                existing_by_path.setdefault(norm_path, []).append(row_idx)
 
     updated = 0
     appended = 0
@@ -468,11 +772,21 @@ def extract_metadata_from_xml(seq_dir: Path, xlsx_path: Path) -> tuple[int, int,
         include_ctd_toc=True,
         attr_map=ich_attr_map,
     )
+    rows += _extract_branch_rows_from_xml(
+        index_xml,
+        base_prefix=None,
+        attr_map=ich_attr_map,
+    )
     rows += _extract_leaf_rows_from_xml(
         eu_xml,
         seq_dir,
         base_prefix="m1/eu",
         include_ctd_toc=False,
+        attr_map=eu_attr_map,
+    )
+    rows += _extract_branch_rows_from_xml(
+        eu_xml,
+        base_prefix="m1/eu",
         attr_map=eu_attr_map,
     )
 
@@ -482,11 +796,29 @@ def extract_metadata_from_xml(seq_dir: Path, xlsx_path: Path) -> tuple[int, int,
             continue
         if file_path == "index.xml" or file_path == "m1/eu/eu-regional.xml":
             continue
-        row_idx = existing_by_path.get(file_path)
+        row_attr = (row.get("attributes") or "").strip()
+        row_toc = (row.get("ctd_toc") or "").strip()
+        row_key = (file_path, row_attr, row_toc)
+        row_idx = existing_by_key.get(row_key)
+        if row_idx is None:
+            candidates = existing_by_path.get(file_path, [])
+            for candidate_idx in candidates:
+                candidate_attr = ""
+                candidate_toc = ""
+                if attr_col:
+                    cell_val = ws.cell(row=candidate_idx, column=attr_col).value
+                    candidate_attr = str(cell_val).strip() if cell_val is not None else ""
+                if toc_col:
+                    cell_val = ws.cell(row=candidate_idx, column=toc_col).value
+                    candidate_toc = str(cell_val).strip() if cell_val is not None else ""
+                if candidate_toc == row_toc and not candidate_attr and row_attr:
+                    row_idx = candidate_idx
+                    break
         if row_idx is None:
             ws.append([row.get(field, "") for field in METADATA_FIELDS])
             row_idx = ws.max_row
-            existing_by_path[file_path] = row_idx
+            existing_by_key[row_key] = row_idx
+            existing_by_path.setdefault(file_path, []).append(row_idx)
             appended += 1
             continue
         for field, value in row.items():
@@ -499,6 +831,7 @@ def extract_metadata_from_xml(seq_dir: Path, xlsx_path: Path) -> tuple[int, int,
             if cell.value is None or str(cell.value).strip() == "":
                 cell.value = value
                 updated += 1
+        existing_by_key[row_key] = row_idx
 
     envelope_fields = extract_eu_envelope_fields(eu_xml)
     envelope_updates = 0
@@ -529,13 +862,15 @@ def extract_metadata_from_xml(seq_dir: Path, xlsx_path: Path) -> tuple[int, int,
                     envelope_updates += 1
 
     if updated or appended or envelope_updates:
+        if not _confirm_metadata_write(xlsx_path):
+            logger.info("Extracted metadata was not saved.")
+            return 0, 0, 0
         wb.save(xlsx_path)
     return updated, appended, envelope_updates
 
 def _norm_href(href: str) -> str:
     """Normalize hrefs for comparison (strip, unify slashes)."""
-    href = (href or "").strip()
-    return href.replace("\\", "/")
+    return PathNormalizer.normalize(href)
 
 def _leaf_href(leaf) -> str:
     """Extract href from a leaf element (xlink:href or href)."""
@@ -610,6 +945,14 @@ def _tokenize_dtd_attlist(content: str) -> list[str]:
     return tokens
 
 def _parse_dtd_attlist(dtd_path: Path) -> dict[str, set[str]]:
+    """Parse ATTLIST declarations from DTD file.
+    
+    Args:
+        dtd_path: Path to DTD file
+        
+    Returns:
+        Dictionary mapping element names to sets of allowed attributes
+    """
     text = dtd_path.read_text(encoding="utf-8", errors="ignore")
     text = re.sub(r"<!--.*?-->", "", text, flags=re.S)
     entities = _parse_dtd_entities(text)
@@ -670,7 +1013,7 @@ def _filter_allowed_attrs(
     local = element_tag.split("}", 1)[-1]
     for name, value in custom_attrs.items():
         if name not in allowed_attrs:
-            print(f"⚠ Attribute '{name}' not allowed for {local} ({context})")
+            logger.warning(f"Attribute '{name}' not allowed for {local} ({context})")
             continue
         filtered[name] = value
     return filtered
@@ -808,7 +1151,7 @@ def validate_xml(xml_path: Path, dtd_path: Path):
     xml = etree.parse(str(xml_path))
     if not dtd.validate(xml):
         raise ValueError(f"DTD validation failed for {xml_path.name}:\n{dtd.error_log.filter_from_errors()}")
-    print(f"✔ Validated {xml_path.name} against {dtd_path.name}")
+    logger.info(f"Validated {xml_path.name} against {dtd_path.name}")
 
 # =========================================================
 # XML generation
@@ -2088,7 +2431,7 @@ def create_eu_regional_xml(
     if dtd_path.exists():
         validate_xml(xml_path, dtd_path)
     else:
-        print(f"⚠️  EU regional DTD not found at {dtd_path}; skipped validation for eu-regional.xml")
+        logger.warning(f"EU regional DTD not found at {dtd_path}; skipped validation for eu-regional.xml")
     return xml_path
 
 # =========================================================
@@ -2106,8 +2449,20 @@ def main(
     eu_xsl_path: str | None = None,
 ):
     base = Path(base_dir)
-    seq_dir = base / sequence_num
-    xlsx_file = base / f"metadata-{sequence_num}.xlsx"
+    raw_sequence = (sequence_num or "").strip()
+    padded_sequence = f"{int(raw_sequence):04d}" if raw_sequence.isdigit() else raw_sequence
+
+    seq_dir = base / raw_sequence
+    xlsx_file = base / f"metadata-{raw_sequence}.xlsx"
+    sequence_for_paths = raw_sequence
+
+    padded_seq_dir = base / padded_sequence
+    if not seq_dir.exists() and padded_sequence != raw_sequence and padded_seq_dir.exists():
+        sequence_for_paths = padded_sequence
+        seq_dir = padded_seq_dir
+        xlsx_file = base / f"metadata-{sequence_for_paths}.xlsx"
+        logger.info(f"Using zero-padded sequence directory: {sequence_for_paths}")
+
     mapping_path = Path(mapfile) if mapfile else None
     eu_mapping_path = Path(eu_mapfile) if eu_mapfile else None
 
@@ -2133,13 +2488,15 @@ def main(
         raise FileNotFoundError(f"Metadata Excel missing: {xlsx_file}")
 
     metadata = load_metadata(xlsx_file)
-    seq_int = int(sequence_num)
+    if not sequence_for_paths.isdigit():
+        raise MetadataError("Sequence number must be numeric (for example: 0001).")
+    seq_int = int(sequence_for_paths)
 
-    print(f"Starting backbone generation for sequence {sequence_num} …")
+    print(f"Starting backbone generation for sequence {sequence_for_paths} …")
     create_eu_regional_xml(
         seq_dir,
         metadata,
-        sequence_num,
+        sequence_for_paths,
         eu_mapping_path=eu_mapping_path,
         xsl_path=eu_xsl_path,
     )
@@ -2158,6 +2515,13 @@ if __name__ == "__main__":
     import argparse
 
     print(f"eCTD-Tool {__version__}")
+    
+    # Check dependencies first
+    try:
+        _check_dependencies()
+    except DependencyError as e:
+        logger.error(str(e))
+        exit(1)
 
     ap = argparse.ArgumentParser(
         description=(
@@ -2171,6 +2535,11 @@ if __name__ == "__main__":
     )
     ap.add_argument("base_directory")
     ap.add_argument("sequence_number")
+    ap.add_argument(
+        "-version",
+        action="version",
+        version=f"%(prog)s {__version__}"
+    )
     ap.add_argument(
         "-scan",
         action="store_true",
