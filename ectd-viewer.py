@@ -39,6 +39,8 @@ python ectd_viewer.py
 
 from __future__ import annotations
 
+__version__ = "0.1.0"
+
 import re
 import html
 from dataclasses import dataclass, field
@@ -547,7 +549,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("eCTD Viewer (Extended)")
+        self.setWindowTitle(f"eCTD Viewer (Extended) v{__version__}")
 
         self.dossier: Optional[EctdDossier] = None
         self.dossier_root: Optional[Path] = None

@@ -13,6 +13,8 @@ import hashlib
 from pathlib import Path
 from lxml import etree
 
+__version__ = "0.1.0"
+
 # =========================================================
 # Utility functions
 # =========================================================
@@ -2154,6 +2156,8 @@ def main(
 
 if __name__ == "__main__":
     import argparse
+
+    print(f"eCTD-Tool {__version__}")
 
     ap = argparse.ArgumentParser(
         description=(
