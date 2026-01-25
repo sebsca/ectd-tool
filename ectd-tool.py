@@ -2,7 +2,6 @@
 """
 ema_ectd_backbone_generator.py
 Generates and validates eCTD 3.2 and EU M1 3.1 compliant XML backbones.
-Version 0.1dev  
 """
 
 import os
