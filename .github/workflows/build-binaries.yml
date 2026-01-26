@@ -28,38 +28,38 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install lxml openpyxl PySide6 nuitka
+          pip install lxml openpyxl PySide6 pyinstaller
       
       - name: Build ectd-tool (Ubuntu)
         if: runner.os == 'Linux'
         run: |
-          python -m nuitka --onefile \
-            --output-dir=dist \
-            --remove-output \
+          pyinstaller --onefile \
+            --dist dist \
+            --build-dir build \
             ectd-tool.py
       
       - name: Build ectd-viewer (Ubuntu)
         if: runner.os == 'Linux'
         run: |
-          python -m nuitka --onefile \
-            --output-dir=dist \
-            --remove-output \
+          pyinstaller --onefile \
+            --dist dist \
+            --build-dir build \
             ectd-viewer.py
       
       - name: Build ectd-tool (Windows)
         if: runner.os == 'Windows'
         run: |
-          python -m nuitka --onefile `
-            --output-dir=dist `
-            --remove-output `
+          pyinstaller --onefile `
+            --dist dist `
+            --build-dir build `
             ectd-tool.py
       
       - name: Build ectd-viewer (Windows)
         if: runner.os == 'Windows'
         run: |
-          python -m nuitka --onefile `
-            --output-dir=dist `
-            --remove-output `
+          pyinstaller --onefile `
+            --dist dist `
+            --build-dir build `
             ectd-viewer.py
       
       - name: Upload Ubuntu artifacts
