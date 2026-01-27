@@ -1,7 +1,7 @@
 # eCTD Project Guidelines for AI Agents
 
 ## Purpose
-This repo contains utilities to generate, validate, and inspect **eCTD (ICH 3.2.2) and EU M1 (3.1.1) XML backbones** from CSV metadata. The primary scripts generate XML, and the viewer inspects/debugs existing dossiers.
+This repo contains utilities to generate, validate, and inspect **eCTD (ICH 3.2.2) and EU M1 (3.1.1) XML backbones** from Excel metadata. The primary script generates XML from metadata workbooks, and the viewer inspects/debugs existing dossiers.
 
 ---
 
@@ -34,10 +34,11 @@ copies or substantial portions of the Software.
 
 | File | Purpose |
 |------|---------|
-| `ectd_fixed.py` | **Preferred** generator: generates `index.xml` from CSV, robust leaf lookup & delete handling |
-| `ectd.py` | Original generator (reference only) |
+| `ectd-tool.py` | **Primary** generator: generates `index.xml` and `eu-regional.xml` from Excel metadata |
 | `ectd-viewer.py` | **Desktop GUI** (PySide6): inspect, navigate, validate eCTD dossiers |
-| `metadata-<sequence>.csv` | Input CSV with file paths, operations, metadata for sequence |
+| `metadata-<sequence>.xlsx` | Input Excel workbook with file paths, operations, metadata for sequence |
+| `ectd_3_2_2_path_to_xml_element_mapping.csv` | CTD mapping: relative paths → ICH XML elements |
+| `ectd_eu_m1_path_to_xml_element_mapping.csv` | EU M1 mapping: relative paths → EU XML elements |
 | `util/dtd/` | DTD files for validation (lxml.etree.DTD) |
 | `util/style/` | XSL stylesheets for output formatting |
 
@@ -45,27 +46,31 @@ copies or substantial portions of the Software.
 
 ## How the Tools Work Together
 
-### 1. **Generator Workflow** (`ectd_fixed.py`)
+### 1. **Generator Workflow** (`ectd-tool.py`)
 ```bash
 source ectd-venv/bin/activate
-python ectd_fixed.py ./Alpro500\ eCTD 0006
+python ectd-tool.py ./Alpro500\ eCTD 0006 [-scan] [-extractXML] [-mapfile PATH] [-eu_mapfile PATH]
 ```
 
 **Input:**
-- Metadata CSV: `metadata-0006.csv` (columns: `file_path`, `operation`, `title`, `modified-*` variants)
-- Previous sequences: scanned for `index.xml` to resolve `modified-file` references
+- Metadata Excel: `metadata-0006.xlsx` with `metadata` sheet (columns: `file_path`, `operation`, `title`, `modified-leaf`, `modified-href`, `ctd_toc`, `attributes`, EU envelope fields)
+- Mapping CSVs: `ectd_3_2_2_path_to_xml_element_mapping.csv` (ICH), `ectd_eu_m1_path_to_xml_element_mapping.csv` (EU)
+- Previous sequences: scanned for `index.xml` to resolve `modified-leaf` references
 
 **Output:**
-- `<dossier_dir>/0006/index.xml` (main backbone)
-- `<dossier_dir>/0006/m1/eu/eu-regional.xml` (EU regional metadata)
+- `<dossier_dir>/<seq>/index.xml` (main ICH 3.2 backbone)
+- `<dossier_dir>/<seq>/m1/eu/eu-regional.xml` (EU M1 3.1 regional metadata, if EU rows present)
 
 **Key behaviors:**
-- CSV tolerant: missing optional columns handled gracefully
-- Operation semantics: `new` / `replace` / `append` / `delete`
+- Excel input: openpyxl-based, flexible column handling
+- Operation semantics: `new` / `replace` / `delete` / `append`
 - Delete handling: uses MD5 of empty content (`d41d8cd98f00b204e9800998ecf8427e`) if file missing
-- Reference resolution: scans prior `index.xml` files to infer `modified-leaf` IDs
-- Href normalization: unified path separators before matching previous leaves
+- Reference resolution: searches both explicit IDs (`modified-leaf`) and href patterns across previous sequence XMLs
+- Mapping-driven hierarchy: `ctd_toc` override or automatic path-to-element mapping
+- Directory attributes: rows with directory paths + `attributes` column apply XML attributes without creating leaves
+- EU envelope: auto-populated from metadata fields (`eu_country`, `eu_submission_type`, etc.)
 - DTD validation: via `lxml.etree.DTD` against `util/dtd/` files
+- XSL output: writes with xml-stylesheet PI and DOCTYPE
 
 ### 2. **Viewer Workflow** (`ectd-viewer.py`)
 ```bash
@@ -96,30 +101,42 @@ Then select a dossier directory (e.g., `Alpro500 eCTD/`).
   - Copy path / href / modified-file / leaf ID
   - Jump to predecessor via modified-file
 
----
-
-## Important Patterns & Behaviors to Preserve
-
-### CSV Expectations
-- **Required column**: `file_path`
+---Excel Metadata Expectations
+- **Required columns**: `file_path`, `operation`, `title`
 - **Optional columns**: 
+  - `modified-leaf` (explicit leaf ID from prior sequence)
+  - `modified-href` (explicit href from prior sequence)
+  - `ctd_toc` or `ctd-toc` (override CTD-TOC element tag)
+  - `attributes` (space-separated `key="value"` pairs for branch elements)
+  - EU envelope fields: `applicant_name`, `submission_type`, `sequence_description`, `eu_country`, `eu_identifier`, `eu_submission_type`, `eu_submission_mode`, `eu_submission_number`, `eu_procedure_number`, `eu_submission_unit_type`, `eu_agency_code`, `eu_procedure_type`, `eu_invented_name`, `eu_inn`, `eu_related_sequence`
+- **Special rows**: set `file_path` to directory path (ends with `/`) to apply `attributes` without creating leaves
+- **Sheet selection**: looks for sheet named `metadata`, falls back to active sheet
   - `operation` (new/replace/delete/append; default: `new`)
   - `title`, `Title`
-  - `modified-href`, `modified-file`, `modified_file_path`
-  - Any `modified-*` variant (generator uses tolerant lookup)
-
-### Replace/Delete Lifecycle
-- **replace**: removes predecessor from consolidated view, adds new version
-- **delete**: removes from consolidated view; in delta view, shows grayed-out and opens predecessor on double-click
-- **append**: adds supplementary content under base document (CTD-TOC view groups these)
+  - `modified-href/Append Lifecycle
+- **new**: creates fresh leaf in sequence
+- **replace**: link to predecessor via `modified-file`, removes predecessor from future consolidation
+- **delete**: link to predecessor via `modified-file`, leaf marked `operation="delete"` with empty checksum
+- **append**: link to predecessor via `modified-file`, adds supplementary leaf to prior document
+- **modified-leaf semantics**: 
+  - Explicit leaf ID lookup: searches prior sequences' `index.xml` files (and referenced regional XMLs) for exact match
+  - Format: leaf ID string without `#` prefix
+- **modified-href semantics**: 
+  - Href pattern lookup: searches prior sequences for matching file hrefs
+  - Fallback to basename match if exact href not found via `PathNormalizer.normalize()`
+- Helper: `_norm_href()` wrapper for comparison
+- File path matching: exact href match first, then basename fallback
+- Must preserve this to match previous leaf IDs correctly and resolve replace/delete/append operationsfId`
+  - Points to prior sequence's `<leaf>` element with specific IDbase document (CTD-TOC view groups these)
 - **modified-file semantics**: 
   - Format: `path/to/index.xml#leafId`
   - Points to prior sequence's `<leaf>` element
   - Critical for backward compatibility with existing `index.xml` files
 
-### Href & Path Normalization
-- All path comparisons normalize slashes (Windows `\` → Unix `/`)
-- Helper: `_norm_href()` style normalization
+### Href & Path NICH 3.2 root backbone (sequence-specific, always generated)
+- **m1/eu/eu-regional.xml**: EU M1 3.1 regional backbone (generated only if EU rows exist in metadata)
+- Auto-discovery: viewer scans `m1/**/` for any regional XML files
+- Separation: ICH index contains references to regional XMLs via leaf `@xlink:href`; regional XMLs contain EU-specific structure
 - Must preserve this to match previous leaf IDs correctly
 
 ### Validation
@@ -179,29 +196,36 @@ warnings: List[str]              # QA issues
 ### GUI (Viewer)
 - PySide6/Qt6 (cross-platform)
 - Custom roles (ROLE_NODEINFO, ROLE_LEAF, ROLE_BACKBONE) for storing metadata on QStandardItem
-- Lazy loading: children only populated on expand
-- Proxy model for filtering/search
-
-### Performance
-- Iterparse streaming for XML (keeps memory low)
-- Lazy tree population per sequence
-- Consolidated cache built once on load (incremental via operation semantics)
-
----
-
-## What NOT to Change Without Discussion
-
-1. **Modified-leaf inference & checksum semantics**  
+- Lazy loading: chilookup & checksum semantics**  
    → Breaking change risk: older `index.xml` files won't link correctly
+   → Search strategy: explicit ID lookup first, then href matching in prior XMLs
 
-2. **CSV-to-leaf mapping & operation semantics**  
+2. **Excel-to-leaf mapping & operation semantics**  
    → Breaking change: workflows depend on new/replace/delete/append meanings
+   → Href resolution: attempts direct match, falls back to basename match
 
-3. **Href normalization logic**  
-   → Must preserve exact path comparison algorithm
+3. **Href normalization logic** (PathNormalizer.normalize)  
+   → Must preserve exact path comparison algorithm to match previous leaves
 
-4. **XML validation method** (currently DTD-based via lxml)  
+4. **Path-to-element mapping files** (`ectd_3_2_2_path_to_xml_element_mapping.csv`, `ectd_eu_m1_path_to_xml_element_mapping.csv`)  
+   → Used for CTD hierarchy; changes affect all generated backbones
+   → Format: `item_type`, `relative_path`, `xml_element` columns
+
+5. **XML validation method** (currently DTD-based via lxml)  
    → Use explicit migration notes if you switch validators
+
+6. **EU envelope field mapping**  
+   → Affects EU M1 generation; preserve all field names and validation enums
+
+2. **CSV-to-leExcel reading/writing for metadata workbooks)
+- `PySide6` (GUI, viewer only)
+
+### File Structure
+- DTDs: `util/dtd/` (shared; must include `ich-ectd-3-2.dtd`, `eu-regional.dtd`, `eu-envelope.mod`)
+- XSLs: `util/style/` (shared; must include `ectd-2-0.xsl`, `eu-regional.xsl`)
+- Mapping CSVs: `ectd_3_2_2_path_to_xml_element_mapping.csv`, `ectd_eu_m1_path_to_xml_element_mapping.csv` at repo root
+- Metadata Excel: `metadata-<seq>.xlsx` at dossier root
+- Sequences: directories matching pattern `\d{4}` (0000–9999) or unpadded `<seq>`
 
 5. **Consolidated-cache algorithm**  
    → Affects how multi-sequence dossiers appear; preserve active-set incrementality
@@ -214,33 +238,50 @@ warnings: List[str]              # QA issues
 - `lxml` (XML parsing, DTD validation)
 - `openpyxl` (if Excel support needed; currently not used in viewer)
 - `PySide6` (GUI, viewer only)
-
-### File Structure
-- DTDs: `<seq_dir>/util/dtd/` (or shared location)
-- XSLs: `<seq_dir>/util/style/`
-- Metadata CSVs: `metadata-<seq>.csv` at dossier root
-- Sequences: directories matching pattern `\d{4}` (0000–9999)
-
-### Virtual Environment
-- Located at `ectd-venv/`
-- Standard Python 3.13+ (check `pyvenv.cfg`)
-- Install: `python -m venv ectd-venv && source ectd-venv/bin/activate && pip install -r requirements.txt`
-
----
-
-## Concrete Examples
-
-### Scanning a Dossier
-```python
-dossier = EctdDossier(Path("./Alpro500 eCTD"))
-dossier.load()
-# Now: dossier.sequences = ["0000", "0001", "0006"]
-# And: dossier.leaves_by_seq["0006"] = [LeafRecord, LeafRecord, ...]
+Generator Command (Basic)
+```bash
+python ectd-tool.py ./Alpro500\ eCTD 0006
 ```
+Reads `./Alpro500 eCTD/metadata-0006.xlsx`, generates `./Alpro500 eCTD/0006/index.xml` and optionally `./Alpro500 eCTD/0006/m1/eu/eu-regional.xml`.
 
-### CSV Row Format (Minimal)
-```csv
-file_path,title
+### Generator Command (With Scan)
+```bash
+python ectd-tool.py ./Alpro500\ eCTD 0006 -scan
+```
+Scans `./Alpro500 eCTD/0006/` directory structure, appends missing rows to `metadata-0006.xlsx`.
+
+### Generator Command (Extract From XML)
+```bash
+python ectd-tool.py ./Alpro500\ eCTD 0006 -extractXML
+```
+Reads existing `index.xml` and referenced regional XMLs, updates `metadata-0006.xlsx` with extracted leaf data.
+
+### Excel Row Format (Minimal)
+| file_path | title | operation |
+|-----------|-------|-----------|
+| m3/quality/documents/tox-study-01.pdf | Toxicology Study | new |
+| m3/safety/cv/investigator.pdf | Investigator CV | new |
+
+### Excel Row Format (With Lifecycle)
+| file_path | title | operation | modified-leaf |
+|-----------|-------|-----------|----------------|
+| m3/quality/documents/tox-study-01-v2.pdf | Toxicology Study (Updated) | replace | LEAF-TOX-001 |
+| m3/quality/summary.xml | Additional Summary | append | LEAF-TOX-SUMMARY |
+
+### Excel Row Format (With Directory Attributes)
+| file_path | title | operation | attributes |
+|-----------|-------|-----------|------------|
+| m3/quality/ | Quality | new | some_attr="value" |
+ or `modified-leaf` lookup? (requires backward-compat review)
+- [ ] Does this change how `operation` is interpreted? (check existing Excel workbooks)
+- [ ] Does this touch href normalization (`PathNormalizer.normalize`)? (test against real paths with backslashes & spaces)
+- [ ] Does this modify DTD validation or structure parsing? (update `util/dtd/` or note externally)
+- [ ] If new Excel column: is it gracefully handled if missing?
+- [ ] Does this change path-to-element mapping logic? (test with custom mapping files)
+- [ ] Did you test with a real multi-sequence dossier (0000→0001→0006)?
+- [ ] Does `-scan` still discover files correctly?
+- [ ] Does `-extractXML` preserve order and extract all metadata?
+- [ ] Does EU regional XML generation work when EU rows are presentitle
 m3/quality/documents/tox-study-01.pdf,Toxicology Study
 m3/safety/cv/investigator.pdf,Investigator CV
 ```

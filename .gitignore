@@ -4,3 +4,23 @@ util/dtd/eu-regional.dtd
 util/dtd/ich-ectd-3-2.dtd
 util/style/ectd-2-0.xsl
 util/style/eu-regional.xsl
+
+# Python caches/build artifacts
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+ectd-venv/
+
+# Test/coverage caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
