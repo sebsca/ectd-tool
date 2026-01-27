@@ -464,6 +464,342 @@ def write_metadata_from_scan(seq_dir: Path, xlsx_path: Path) -> int:
         return 0
     return new_rows
 
+def _format_attr_value(value: str) -> tuple[str, str]:
+    """Return attribute value and quote char for metadata serialization."""
+    value = "" if value is None else str(value)
+    if '"' in value and "'" not in value:
+        return value, "'"
+    if '"' in value and "'" in value:
+        return value.replace('"', "&quot;"), '"'
+    return value, '"'
+
+def _format_attrs_for_metadata(attrs: dict[str, str]) -> str:
+    """Serialize element attributes for the metadata 'attributes' column."""
+    items: list[tuple[str, str]] = []
+    for raw_name, raw_value in (attrs or {}).items():
+        if raw_value is None or str(raw_value).strip() == "":
+            continue
+        if raw_name.endswith("}href") or raw_name == "href":
+            continue
+        if raw_name.startswith("{"):
+            uri, local = raw_name[1:].split("}", 1)
+            name = "xml:lang" if uri == XML_NS else local
+        else:
+            name = raw_name
+        items.append((name, str(raw_value)))
+    if not items:
+        return ""
+    items.sort(key=lambda kv: kv[0])
+    parts: list[str] = []
+    for name, value in items:
+        safe_value, quote = _format_attr_value(value)
+        parts.append(f"{name}={quote}{safe_value}{quote}")
+    return " ".join(parts)
+
+def _leaf_title_text(leaf) -> str:
+    """Extract the leaf title text (first child <title>)."""
+    try:
+        titles = leaf.xpath("./*[local-name()='title']")
+    except Exception:
+        titles = []
+    if titles:
+        return (titles[0].text or "").strip()
+    return ""
+
+def _leaf_ctd_toc(leaf) -> str:
+    """Return the most relevant CTD-TOC tag for a leaf."""
+    skip = {"leaf", "title", "specific", "pi-doc", "m1-eu", "eu-backbone", "ectd"}
+    node = leaf.getparent()
+    while node is not None and node.getparent() is not None:
+        name = _local_name(node.tag)
+        if name and name not in skip:
+            return name
+        node = node.getparent()
+    return ""
+
+def _normalize_seq_relative_path(path: str) -> str:
+    """Normalize a path to be sequence-relative (no ../0000 prefixes)."""
+    path = PathNormalizer.normalize(path or "")
+    if not path:
+        return ""
+    if path.startswith("./"):
+        path = path[2:]
+    while path.startswith("../"):
+        path = path[3:]
+    if re.match(r"^\d{4}/", path):
+        path = path[5:]
+    return path.lstrip("/")
+
+def _resolve_leaf_file_path(xml_rel_dir: str, href: str) -> str:
+    """Resolve a leaf href to a sequence-relative file path."""
+    href = _norm_href(href or "")
+    if not href:
+        return ""
+    if posixpath.isabs(href):
+        return _normalize_seq_relative_path(href)
+    if not xml_rel_dir or xml_rel_dir == ".":
+        return _normalize_seq_relative_path(href)
+    joined = posixpath.join(xml_rel_dir, href)
+    return _normalize_seq_relative_path(posixpath.normpath(joined))
+
+def _collect_toc_ancestors(root) -> set[int]:
+    """Return IDs of all elements that are ancestors of any leaf."""
+    toc_ancestors: set[int] = set()
+    try:
+        leaves = root.xpath(".//*[local-name()='leaf']")
+    except Exception:
+        leaves = []
+    for leaf in leaves:
+        node = leaf.getparent()
+        while node is not None and node.getparent() is not None:
+            toc_ancestors.add(id(node))
+            node = node.getparent()
+    return toc_ancestors
+
+def _extract_eu_fields(root) -> dict[str, str]:
+    """Extract EU envelope fields from eu-regional.xml root."""
+    fields: dict[str, str] = {}
+    envelope = root.xpath(".//*[local-name()='envelope']")
+    if not envelope:
+        return fields
+    env = envelope[0]
+    fields["eu_country"] = (env.get("country") or "").strip()
+    ident = env.xpath("./*[local-name()='identifier']")
+    if ident:
+        fields["eu_identifier"] = (ident[0].text or "").strip()
+    submission = env.xpath("./*[local-name()='submission']")
+    if submission:
+        sub = submission[0]
+        fields["eu_submission_type"] = (sub.get("type") or "").strip()
+        fields["eu_submission_mode"] = (sub.get("mode") or "").strip()
+        number = sub.xpath("./*[local-name()='number']")
+        if number:
+            fields["eu_submission_number"] = (number[0].text or "").strip()
+        proc = sub.xpath(".//*[local-name()='procedure-tracking']/*[local-name()='number']")
+        if proc:
+            fields["eu_procedure_number"] = (proc[0].text or "").strip()
+    unit = env.xpath("./*[local-name()='submission-unit']")
+    if unit:
+        fields["eu_submission_unit_type"] = (unit[0].get("type") or "").strip()
+    applicant = env.xpath("./*[local-name()='applicant']")
+    if applicant:
+        fields["applicant_name"] = (applicant[0].text or "").strip()
+    agency = env.xpath("./*[local-name()='agency']")
+    if agency:
+        fields["eu_agency_code"] = (agency[0].get("code") or "").strip()
+    procedure = env.xpath("./*[local-name()='procedure']")
+    if procedure:
+        fields["eu_procedure_type"] = (procedure[0].get("type") or "").strip()
+    invented = env.xpath("./*[local-name()='invented-name']")
+    if invented:
+        fields["eu_invented_name"] = (invented[0].text or "").strip()
+    inn = env.xpath("./*[local-name()='inn']")
+    if inn:
+        fields["eu_inn"] = (inn[0].text or "").strip()
+    related = env.xpath("./*[local-name()='related-sequence']")
+    if related:
+        fields["eu_related_sequence"] = (related[0].text or "").strip()
+    sub_desc = env.xpath("./*[local-name()='submission-description']")
+    if sub_desc:
+        fields["sequence_description"] = (sub_desc[0].text or "").strip()
+    return fields
+
+def _leaf_row_from_elem(
+    leaf,
+    seq_dir: Path,
+    rel_dir: str,
+    modified_href_cache: dict[Path, dict[str, str]],
+) -> dict[str, str] | None:
+    href = _leaf_href(leaf)
+    if href.lower().endswith(".xml"):
+        return None
+    ctd_toc = _leaf_ctd_toc(leaf)
+    file_path = _resolve_leaf_file_path(rel_dir, href)
+    operation = (leaf.get("operation") or "new").strip().lower()
+    title = _leaf_title_text(leaf) or (Path(file_path).name if file_path else "")
+    modified_file = (leaf.get("modified-file") or "").strip()
+    modified_leaf = ""
+    modified_href = ""
+    if modified_file:
+        _path, leaf_id = _parse_modified_file_ref(modified_file)
+        if leaf_id:
+            modified_leaf = leaf_id
+        modified_href = _resolve_modified_href(seq_dir, modified_file, modified_href_cache)
+        if not file_path and modified_href:
+            if _path is not None:
+                base_dir = posixpath.dirname(_path.as_posix())
+                file_path = _resolve_leaf_file_path(base_dir, modified_href)
+            else:
+                file_path = modified_href
+    return {
+        "file_path": file_path,
+        "title": title,
+        "attributes": "",
+        "operation": operation,
+        "modified-leaf": modified_leaf,
+        "modified-href": modified_href,
+        "ctd_toc": ctd_toc,
+    }
+
+def _extract_rows_from_xml(
+    xml_path: Path,
+    seq_dir: Path,
+    modified_href_cache: dict[Path, dict[str, str]],
+    is_index_xml: bool = False,
+) -> tuple[list[dict[str, str]], dict[str, str]]:
+    """Extract rows from a single XML file (no reference following)."""
+    try:
+        tree = etree.parse(str(xml_path))
+    except Exception as exc:
+        logger.warning(f"Skipping unreadable XML: {xml_path} ({exc})")
+        return [], {}
+
+    root = tree.getroot()
+    root_local = _local_name(root.tag)
+    eu_fields: dict[str, str] = {}
+    if root_local == "eu-backbone":
+        eu_fields = _extract_eu_fields(root)
+
+    try:
+        rel_xml_path = xml_path.resolve().relative_to(seq_dir.resolve()).as_posix()
+    except Exception:
+        rel_xml_path = xml_path.name
+    rel_dir = posixpath.dirname(rel_xml_path)
+
+    toc_ancestors = _collect_toc_ancestors(root)
+    rows: list[dict[str, str]] = []
+    for elem in root.iter():
+        local = _local_name(getattr(elem, "tag", ""))
+        if not local or local == "title":
+            continue
+        if local == "leaf":
+            row = _leaf_row_from_elem(elem, seq_dir, rel_dir, modified_href_cache)
+            if row:
+                rows.append(row)
+            continue
+        if id(elem) not in toc_ancestors:
+            continue
+        if not elem.attrib:
+            continue
+        attrs_text = _format_attrs_for_metadata(dict(elem.attrib))
+        if not attrs_text:
+            continue
+        dir_path = _branch_directory_path(elem, base_prefix=rel_dir if rel_dir else None)
+        if not dir_path:
+            continue
+        dir_path = _normalize_seq_relative_path(dir_path)
+        rows.append({
+            "file_path": dir_path,
+            "title": "",
+            "attributes": attrs_text,
+            "operation": "",
+            "modified-leaf": "",
+            "modified-href": "",
+            "ctd_toc": _local_name(elem.tag),
+        })
+    return rows, eu_fields
+
+def extract_xml_to_metadata(seq_dir: Path, xlsx_path: Path) -> int:
+    """Extract metadata rows from index.xml and referenced XMLs into Excel."""
+    try:
+        import openpyxl
+    except ImportError as exc:
+        raise ImportError(
+            "openpyxl is required to write Excel metadata files. "
+            "Install it in the current environment."
+        ) from exc
+
+    rows: list[dict[str, str]] = []
+    eu_fields: dict[str, str] = {}
+    modified_href_cache: dict[Path, dict[str, str]] = {}
+
+    index_path = seq_dir / "index.xml"
+    if not index_path.exists():
+        raise FileNotFoundError(f"No index.xml found in {seq_dir}")
+
+    try:
+        index_tree = etree.parse(str(index_path))
+    except Exception as exc:
+        raise XMLValidationError(f"Could not parse index.xml: {exc}") from exc
+
+    index_root = index_tree.getroot()
+    index_toc_ancestors = _collect_toc_ancestors(index_root)
+    index_rel_dir = ""
+    index_seen_stack: set[Path] = set()
+
+    for elem in index_root.iter():
+        local = _local_name(getattr(elem, "tag", ""))
+        if not local or local == "title":
+            continue
+        if local == "leaf":
+            href = _leaf_href(elem)
+            href_path = href.split("#", 1)[0] if href else ""
+            row = _leaf_row_from_elem(elem, seq_dir, index_rel_dir, modified_href_cache)
+            if row:
+                rows.append(row)
+            if href_path.lower().endswith(".xml"):
+                ref_path = (seq_dir / href_path).resolve()
+                try:
+                    ref_path.relative_to(seq_dir.resolve())
+                except Exception:
+                    ref_path = None
+                if ref_path and ref_path.exists() and ref_path.is_file():
+                    if ref_path not in index_seen_stack and ref_path != index_path.resolve():
+                        index_seen_stack.add(ref_path)
+                        ref_rows, ref_eu = _extract_rows_from_xml(
+                            ref_path,
+                            seq_dir,
+                            modified_href_cache,
+                            is_index_xml=False,
+                        )
+                        if ref_eu and not eu_fields:
+                            eu_fields.update(ref_eu)
+                        rows.extend(ref_rows)
+                        index_seen_stack.remove(ref_path)
+            continue
+
+        if not elem.attrib:
+            continue
+        attrs_text = _format_attrs_for_metadata(dict(elem.attrib))
+        if not attrs_text:
+            continue
+        dir_path = _branch_directory_path(elem, base_prefix=None)
+        if not dir_path and id(elem) not in index_toc_ancestors:
+            dir_path = ""
+        if not dir_path and id(elem) in index_toc_ancestors:
+            continue
+        if dir_path:
+            dir_path = _normalize_seq_relative_path(dir_path)
+        rows.append({
+            "file_path": dir_path,
+            "title": "",
+            "attributes": attrs_text,
+            "operation": "",
+            "modified-leaf": "",
+            "modified-href": "",
+            "ctd_toc": _local_name(elem.tag),
+        })
+
+    if eu_fields and rows:
+        rows[0].update({k: v for k, v in eu_fields.items() if v})
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "metadata"
+    ws.append(METADATA_FIELDS)
+    for row in rows:
+        ws.append([row.get(field, "") for field in METADATA_FIELDS])
+
+    if _confirm_metadata_write(xlsx_path):
+        wb.save(xlsx_path)
+        return len(rows)
+    logger.info("Metadata extraction was not saved.")
+    return 0
+
+# Backwards-compatible camelCase alias requested by user
+def extractXML(seq_dir: Path, xlsx_path: Path) -> int:
+    return extract_xml_to_metadata(seq_dir, xlsx_path)
+
 def _norm_href(href: str) -> str:
     """Normalize hrefs for comparison (strip, unify slashes)."""
     return PathNormalizer.normalize(href)
@@ -588,472 +924,6 @@ def _branch_directory_path(node, base_prefix: str | None = None) -> str:
     if not common_dir.endswith("/"):
         common_dir = common_dir + "/"
     return common_dir
-
-def _ctd_toc_for_leaf(leaf) -> str:
-    """
-    Derive a CTD TOC tag for a leaf.
-
-    For regional XML, the direct parent can be 'specific' or 'pi-doc'.
-    In that case, use the nearest ancestor that is not a container wrapper.
-    """
-    containers = {"specific", "pi-doc", "m1-eu"}
-    node = leaf.getparent()
-    while node is not None and getattr(node, "tag", None):
-        local = _local_name(node.tag)
-        if local and local not in containers:
-            return local
-        node = node.getparent()
-    parent = leaf.getparent()
-    return _local_name(parent.tag) if parent is not None and parent.tag else ""
-
-def _ctd_toc_for_node(node) -> str:
-    """Derive a CTD TOC tag for non-leaf nodes."""
-    containers = {"specific", "pi-doc", "m1-eu"}
-    cur = node
-    while cur is not None and getattr(cur, "tag", None):
-        local = _local_name(cur.tag)
-        if local and local not in containers:
-            return local
-        cur = cur.getparent()
-    return _local_name(node.tag) if getattr(node, "tag", None) else ""
-
-def _format_attrs(attrs: dict[str, str]) -> str:
-    if not attrs:
-        return ""
-    return " ".join(f'{k}="{v}"' for k, v in attrs.items())
-
-def extract_eu_envelope_fields(xml_path: Path) -> dict[str, str]:
-    """Extract EU envelope values from a regional XML."""
-    if not xml_path.exists():
-        return {}
-    try:
-        root = etree.parse(xml_path).getroot()
-    except OSError:
-        return {}
-    envelope = root.xpath("//*[local-name()='envelope']")
-    envelope = envelope[0] if envelope else None
-    if envelope is None:
-        return {}
-
-    submission = envelope.xpath("./*[local-name()='submission']")
-    submission = submission[0] if submission else None
-    submission_number = ""
-    procedure_number = ""
-    submission_type = ""
-    submission_mode = ""
-    if submission is not None:
-        submission_type = submission.get("type") or ""
-        submission_mode = submission.get("mode") or ""
-        submission_number = submission.xpath("string(./*[local-name()='number'])") or ""
-        proc_tracking = submission.xpath("./*[local-name()='procedure-tracking']")
-        proc_tracking = proc_tracking[0] if proc_tracking else None
-        if proc_tracking is not None:
-            procedure_number = proc_tracking.xpath("string(./*[local-name()='number'])") or ""
-
-    submission_unit = envelope.xpath("./*[local-name()='submission-unit']")
-    submission_unit = submission_unit[0] if submission_unit else None
-    agency = envelope.xpath("./*[local-name()='agency']")
-    agency = agency[0] if agency else None
-    procedure = envelope.xpath("./*[local-name()='procedure']")
-    procedure = procedure[0] if procedure else None
-
-    return {
-        "eu_country": envelope.get("country") or "",
-        "eu_identifier": envelope.xpath("string(./*[local-name()='identifier'])") or "",
-        "eu_submission_type": submission_type,
-        "eu_submission_mode": submission_mode,
-        "eu_submission_number": submission_number,
-        "eu_procedure_number": procedure_number,
-        "eu_submission_unit_type": submission_unit.get("type") if submission_unit is not None else "",
-        "applicant_name": envelope.xpath("string(./*[local-name()='applicant'])") or "",
-        "eu_agency_code": agency.get("code") if agency is not None else "",
-        "eu_procedure_type": procedure.get("type") if procedure is not None else "",
-        "eu_invented_name": envelope.xpath("string(./*[local-name()='invented-name'])") or "",
-        "eu_inn": envelope.xpath("string(./*[local-name()='inn'])") or "",
-        "eu_related_sequence": envelope.xpath("string(./*[local-name()='related-sequence'])") or "",
-        "sequence_description": envelope.xpath("string(./*[local-name()='submission-description'])") or "",
-    }
-
-def _row_key(file_path: str, attributes: str, ctd_toc: str) -> tuple[str, str, str]:
-    return (_norm_href(file_path), (attributes or "").strip(), (ctd_toc or "").strip())
-
-def _leaf_row_from_leaf(
-    leaf,
-    seq_dir: Path,
-    base_prefix: str | None,
-    cache: dict[Path, dict[str, str]],
-) -> dict[str, str]:
-    href = _leaf_href(leaf)
-    file_path = href
-    if href and base_prefix and not href.startswith(base_prefix + "/"):
-        file_path = f"{base_prefix}/{href}"
-    title = leaf.xpath("string(./*[local-name()='title'])") or ""
-    operation = (leaf.get("operation") or "new").strip().lower()
-    modified_file = leaf.get("modified-file") or ""
-    _rel_path, modified_leaf = _parse_modified_file_ref(modified_file)
-    modified_href = ""
-    if modified_file:
-        modified_href = _resolve_modified_href(seq_dir, modified_file, cache)
-        if modified_href and base_prefix and not modified_href.startswith(base_prefix + "/"):
-            modified_href = f"{base_prefix}/{modified_href}"
-    if not file_path and modified_href:
-        file_path = modified_href
-    row = {
-        "file_path": file_path,
-        "title": title,
-        "operation": operation,
-        "modified-leaf": modified_leaf or "",
-        "modified-href": modified_href,
-    }
-    toc = _ctd_toc_for_leaf(leaf)
-    if toc:
-        row["ctd_toc"] = toc
-    return row
-
-def _extract_rows_from_xml_in_order(
-    xml_path: Path,
-    seq_dir: Path,
-    base_prefix: str | None,
-    attr_map: dict[str, set[str]] | None,
-    cache: dict[Path, dict[str, str]],
-    attr_map_for_ref=None,
-) -> list[dict[str, str]]:
-    """Extract leaf and attribute-bearing branch rows in document order."""
-    if not xml_path.exists():
-        return []
-    rows: list[dict[str, str]] = []
-    branch_seen: set[tuple[str, str, str]] = set()
-    xml = etree.parse(xml_path)
-    root = xml.getroot()
-
-    def _branch_rows_from_modified_leaf(leaf) -> list[dict[str, str]]:
-        modified_file = leaf.get("modified-file") or ""
-        rel_path, leaf_id = _parse_modified_file_ref(modified_file)
-        if rel_path is None or not leaf_id:
-            return []
-        ref_attr_map = attr_map_for_ref(rel_path) if attr_map_for_ref else attr_map
-        xml_ref_path = (seq_dir / rel_path)
-        if not xml_ref_path.exists():
-            return []
-        try:
-            ref_xml = etree.parse(str(xml_ref_path))
-        except OSError:
-            return []
-        try:
-            matches = ref_xml.xpath("//*[local-name()='leaf' and @ID=$id]", id=leaf_id)
-        except Exception:
-            matches = []
-        if not matches:
-            return []
-        node = matches[0].getparent()
-        if node is None:
-            return []
-        ancestors = []
-        cur = node
-        while cur is not None and cur.getparent() is not None:
-            ancestors.append(cur)
-            cur = cur.getparent()
-        ancestors.reverse()
-        out: list[dict[str, str]] = []
-        for anc in ancestors:
-            attrs = _collect_allowed_attrs(anc, ref_attr_map)
-            if not attrs:
-                continue
-            branch_path = _branch_directory_path(anc, base_prefix)
-            if not branch_path:
-                continue
-            row = {
-                "file_path": branch_path,
-                "title": _local_name(anc.tag),
-                "operation": "new",
-                "ctd_toc": _ctd_toc_for_node(anc),
-                "attributes": _format_attrs(attrs),
-            }
-            key = _row_key(row["file_path"], row["attributes"], row["ctd_toc"])
-            if key in branch_seen:
-                continue
-            branch_seen.add(key)
-            out.append(row)
-        return out
-
-    for node in root.iter():
-        local = _local_name(getattr(node, "tag", ""))
-        if not local:
-            continue
-
-        if local == "leaf":
-            leaf = node
-            operation = (leaf.get("operation") or "new").strip().lower()
-            if operation == "delete":
-                rows.extend(_branch_rows_from_modified_leaf(leaf))
-            rows.append(_leaf_row_from_leaf(leaf, seq_dir, base_prefix, cache))
-            continue
-
-        attrs = _collect_allowed_attrs(node, attr_map)
-        if not attrs:
-            continue
-        branch_path = _branch_directory_path(node, base_prefix)
-        if not branch_path:
-            continue
-        rows.append(
-            {
-                "file_path": branch_path,
-                "title": local,
-                "operation": "new",
-                "ctd_toc": _ctd_toc_for_node(node),
-                "attributes": _format_attrs(attrs),
-            }
-        )
-
-    return rows
-
-def extract_metadata_from_xml(seq_dir: Path, xlsx_path: Path) -> tuple[int, int, int]:
-    """
-    Update metadata Excel from index.xml and referenced regional XMLs.
-
-    Regional XML rows are inlined at the point their XML is referenced in index.xml.
-    """
-    try:
-        import openpyxl
-    except ImportError as exc:
-        raise ImportError(
-            "openpyxl is required to write Excel metadata files. "
-            "Install it in the current environment."
-        ) from exc
-
-    if xlsx_path.exists():
-        wb = openpyxl.load_workbook(xlsx_path)
-        ws = _select_metadata_sheet(wb)
-    else:
-        wb = openpyxl.Workbook()
-        ws = wb.active
-        ws.title = "metadata"
-        ws.append(METADATA_FIELDS)
-
-    header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
-    headers = [str(h).strip() if h is not None else "" for h in (header_row or [])]
-    for field in METADATA_FIELDS:
-        if field == "ctd_toc" and ("ctd_toc" in headers or "ctd-toc" in headers):
-            continue
-        if field not in headers:
-            headers.append(field)
-            ws.cell(row=1, column=len(headers), value=field)
-
-    col_idx = {name: idx + 1 for idx, name in enumerate(headers) if name}
-    if "ctd_toc" not in col_idx and "ctd-toc" in col_idx:
-        col_idx["ctd_toc"] = col_idx["ctd-toc"]
-    file_col = col_idx.get("file_path")
-    attr_col = col_idx.get("attributes")
-    toc_col = col_idx.get("ctd_toc")
-
-    def _row_dict_from_sheet(row_idx: int) -> dict[str, str]:
-        data: dict[str, str] = {}
-        for name, col in col_idx.items():
-            val = ws.cell(row=row_idx, column=col).value
-            data[name] = "" if val is None else str(val)
-        return data
-
-    existing_rows_by_key: dict[tuple[str, str, str], list[dict[str, str]]] = {}
-    if file_col:
-        for row_idx in range(2, ws.max_row + 1):
-            file_val = ws.cell(row=row_idx, column=file_col).value
-            if file_val is None:
-                continue
-            file_path = _norm_href(str(file_val))
-            if not file_path:
-                continue
-            attr_val = ""
-            toc_val = ""
-            if attr_col:
-                cell_val = ws.cell(row=row_idx, column=attr_col).value
-                attr_val = str(cell_val).strip() if cell_val is not None else ""
-            if toc_col:
-                cell_val = ws.cell(row=row_idx, column=toc_col).value
-                toc_val = str(cell_val).strip() if cell_val is not None else ""
-            key = _row_key(file_path, attr_val, toc_val)
-            existing_rows_by_key.setdefault(key, []).append(_row_dict_from_sheet(row_idx))
-
-    index_xml = seq_dir / "index.xml"
-    if not index_xml.exists():
-        raise FileNotFoundError(f"Backbone missing: {index_xml}")
-
-    ich_dtd = seq_dir / UTIL_DTD_DIR / ICH_DTD_FILENAME
-    eu_dtd = seq_dir / UTIL_DTD_DIR / EU_DTD_FILENAME
-    ich_attr_map = _parse_dtd_attlist(ich_dtd) if ich_dtd.exists() else {}
-    eu_attr_map = _parse_dtd_attlist(eu_dtd) if eu_dtd.exists() else {}
-
-    cache: dict[Path, dict[str, str]] = {}
-    index_tree = etree.parse(index_xml)
-    index_root = index_tree.getroot()
-
-    extracted_rows: list[dict[str, str]] = []
-    regional_cache: dict[Path, list[dict[str, str]]] = {}
-    referenced_regionals: list[Path] = []
-    branch_seen: set[tuple[str, str, str]] = set()
-
-    def _branch_rows_from_modified_leaf(leaf) -> list[dict[str, str]]:
-        modified_file = leaf.get("modified-file") or ""
-        rel_path, leaf_id = _parse_modified_file_ref(modified_file)
-        if rel_path is None or not leaf_id:
-            return []
-        ref_xml_path = (seq_dir / rel_path)
-        if not ref_xml_path.exists():
-            return []
-        ref_attr_map = eu_attr_map if ref_xml_path.name == "eu-regional.xml" else ich_attr_map
-        base_prefix = "m1/eu" if ref_xml_path.name == "eu-regional.xml" else None
-        try:
-            ref_xml = etree.parse(str(ref_xml_path))
-        except OSError:
-            return []
-        try:
-            matches = ref_xml.xpath("//*[local-name()='leaf' and @ID=$id]", id=leaf_id)
-        except Exception:
-            matches = []
-        if not matches:
-            return []
-        node = matches[0].getparent()
-        if node is None:
-            return []
-        ancestors = []
-        cur = node
-        while cur is not None and cur.getparent() is not None:
-            ancestors.append(cur)
-            cur = cur.getparent()
-        ancestors.reverse()
-        out: list[dict[str, str]] = []
-        for anc in ancestors:
-            attrs = _collect_allowed_attrs(anc, ref_attr_map)
-            if not attrs:
-                continue
-            branch_path = _branch_directory_path(anc, base_prefix)
-            if not branch_path:
-                continue
-            row = {
-                "file_path": branch_path,
-                "title": _local_name(anc.tag),
-                "operation": "new",
-                "ctd_toc": _ctd_toc_for_node(anc),
-                "attributes": _format_attrs(attrs),
-            }
-            key = _row_key(row["file_path"], row["attributes"], row["ctd_toc"])
-            if key in branch_seen:
-                continue
-            branch_seen.add(key)
-            out.append(row)
-        return out
-
-    def _regional_rows_for_href(href: str) -> list[dict[str, str]]:
-        regional_path = (seq_dir / href).resolve()
-        try:
-            regional_path.relative_to(seq_dir.resolve())
-        except Exception:
-            return []
-        if not regional_path.exists() or not regional_path.is_file():
-            return []
-        if regional_path in regional_cache:
-            return regional_cache[regional_path]
-        base_prefix = posixpath.dirname(href) or None
-        regional_rows = _extract_rows_from_xml_in_order(
-            regional_path,
-            seq_dir,
-            base_prefix=base_prefix,
-            attr_map=eu_attr_map,
-            cache=cache,
-            attr_map_for_ref=lambda p: eu_attr_map if p.name == "eu-regional.xml" else ich_attr_map,
-        )
-        regional_cache[regional_path] = regional_rows
-        referenced_regionals.append(regional_path)
-        return regional_rows
-
-    for node in index_root.iter():
-        local = _local_name(getattr(node, "tag", ""))
-        if not local:
-            continue
-
-        if local == "leaf":
-            operation = (node.get("operation") or "new").strip().lower()
-            if operation == "delete":
-                extracted_rows.extend(_branch_rows_from_modified_leaf(node))
-            extracted_rows.append(_leaf_row_from_leaf(node, seq_dir, base_prefix=None, cache=cache))
-            href = _leaf_href(node)
-            if href.lower().endswith(".xml") and href.lower() != "index.xml":
-                extracted_rows.extend(_regional_rows_for_href(href))
-            continue
-
-        branch_attrs = _collect_allowed_attrs(node, ich_attr_map)
-        if not branch_attrs:
-            continue
-        branch_path = _branch_directory_path(node, base_prefix=None)
-        if not branch_path:
-            continue
-        extracted_rows.append(
-            {
-                "file_path": branch_path,
-                "title": local,
-                "operation": "new",
-                "ctd_toc": _ctd_toc_for_node(node),
-                "attributes": _format_attrs(branch_attrs),
-            }
-        )
-
-    updated = 0
-    appended = 0
-    ordered_rows: list[dict[str, str]] = []
-    for row in extracted_rows:
-        file_path = _norm_href(row.get("file_path") or "")
-        if not file_path:
-            continue
-        row_attr = (row.get("attributes") or "").strip()
-        row_toc = (row.get("ctd_toc") or "").strip()
-        key = _row_key(file_path, row_attr, row_toc)
-        existing_list = existing_rows_by_key.get(key, [])
-        if existing_list:
-            row_data = existing_list.pop(0)
-            for field in METADATA_FIELDS:
-                new_val = (row.get(field) or "").strip()
-                if not new_val:
-                    continue
-                cur_val = (row_data.get(field) or "").strip()
-                if not cur_val:
-                    row_data[field] = new_val
-                    updated += 1
-            ordered_rows.append(row_data)
-        else:
-            row_data = {field: row.get(field, "") for field in METADATA_FIELDS}
-            row_data["file_path"] = file_path
-            ordered_rows.append(row_data)
-            appended += 1
-
-    envelope_updates = 0
-    if referenced_regionals:
-        env_fields = extract_eu_envelope_fields(referenced_regionals[0])
-        if env_fields and ordered_rows:
-            target = None
-            for row_data in ordered_rows:
-                fp = _norm_href(row_data.get("file_path") or "")
-                if fp.startswith("m1/eu/"):
-                    target = row_data
-                    break
-            if target is None:
-                target = ordered_rows[0]
-            for field, value in env_fields.items():
-                if not value:
-                    continue
-                cur_val = (target.get(field) or "").strip()
-                if not cur_val:
-                    target[field] = value
-                    envelope_updates += 1
-
-    if updated or appended or envelope_updates:
-        if not _confirm_metadata_write(xlsx_path):
-            logger.info("Extracted metadata was not saved.")
-            return 0, 0, 0
-        if ws.max_row >= 2:
-            ws.delete_rows(2, ws.max_row - 1)
-        for row_data in ordered_rows:
-            ws.append([row_data.get(h, "") for h in headers])
-        wb.save(xlsx_path)
-    return updated, appended, envelope_updates
 
 def _parse_custom_attributes(raw: str) -> dict[str, str]:
     """Parse attributes in the form: key="value" key2='value2'."""
@@ -1204,6 +1074,8 @@ def _referenced_xmls_from_index(prev_dir: Path) -> list[Path]:
                 href = _leaf_href(leaf)
                 if not href:
                     continue
+                if "#" in href:
+                    href = href.split("#", 1)[0]
                 if not href.lower().endswith(".xml"):
                     continue
                 p = (prev_dir / href).resolve()
@@ -2263,7 +2135,6 @@ def create_eu_regional_xml(
     metadata_rows: list[dict],
     sequence_num: str,
     eu_mapping_path: Path | None = None,
-    xsl_path: str | None = None,
 ) -> Path | None:
     """Build eu-regional.xml (EU M1 3.1) and map EU files into proper sections."""
     eu_rows: list[dict] = []
@@ -2901,8 +2772,7 @@ def create_eu_regional_xml(
     m1_eu_dir.mkdir(parents=True, exist_ok=True)
     xml_path = m1_eu_dir / "eu-regional.xml"
 
-    if xsl_path is None:
-        xsl_path = (Path("..") / ".." / UTIL_STYLE_DIR / EU_XSL_FILENAME).as_posix()
+    xsl_path = (Path("..") / ".." / UTIL_STYLE_DIR / EU_XSL_FILENAME).as_posix()
     doctype = _build_doctype(
         root_name,
         (Path("..") / ".." / UTIL_DTD_DIR / EU_DTD_FILENAME).as_posix(),
@@ -2929,11 +2799,9 @@ def main(
     base_dir: str,
     sequence_num: str,
     scan: bool = False,
-    mapfile: str | None = None,
     extract_xml: bool = False,
+    mapfile: str | None = None,
     eu_mapfile: str | None = None,
-    xsl_path: str | None = None,
-    eu_xsl_path: str | None = None,
 ):
     base = Path(base_dir)
     raw_sequence = (sequence_num or "").strip()
@@ -2960,20 +2828,13 @@ def main(
     if xlsx_file.exists():
         ensure_metadata_columns(xlsx_file)
 
-    if extract_xml:
-        updated, appended, envelope_updates = extract_metadata_from_xml(seq_dir, xlsx_file)
-        print(
-            f"✔ Extracted XML into {xlsx_file}: "
-            f"{appended} new rows, {updated} filled cells, {envelope_updates} envelope cells"
-        )
+    if scan:
+        print("ℹ Skipped backbone generation due to -scan.")
+        return
 
-    if scan or extract_xml:
-        if scan and extract_xml:
-            print("ℹ Skipped backbone generation due to -scan and -extractXML.")
-        elif scan:
-            print("ℹ Skipped backbone generation due to -scan.")
-        else:
-            print("ℹ Skipped backbone generation due to -extractXML.")
+    if extract_xml:
+        count = extract_xml_to_metadata(seq_dir, xlsx_file)
+        print(f"✔ Extracted {count} rows to {xlsx_file}")
         return
 
     if not xlsx_file.exists():
@@ -2990,7 +2851,6 @@ def main(
         metadata,
         sequence_for_paths,
         eu_mapping_path=eu_mapping_path,
-        xsl_path=eu_xsl_path,
     )
     create_index_xml(
         seq_dir,
@@ -2998,7 +2858,6 @@ def main(
         base,
         seq_int,
         mapping_path=mapping_path,
-        xsl_path=xsl_path,
     )
     write_index_md5(seq_dir, seq_dir / "index.xml")
     print("✅ All XML backbones created and validated!")
@@ -3040,10 +2899,7 @@ if __name__ == "__main__":
     ap.add_argument(
         "-extractXML",
         action="store_true",
-        help=(
-            "Extract metadata from index.xml and referenced regional XML files "
-            "and write it into metadata-<seq>.xlsx."
-        ),
+        help="Extract metadata rows from index.xml and referenced XMLs into metadata-<seq>.xlsx.",
     )
     ap.add_argument(
         "-eu_mapfile",
@@ -3063,24 +2919,12 @@ if __name__ == "__main__":
             "Required columns: item_type (directory|file), relative_path, xml_element."
         ),
     )
-    ap.add_argument(
-        "-xsl",
-        default=None,
-        help="Path to XSL for index.xml (default: util/style/ectd-2-0.xsl).",
-    )
-    ap.add_argument(
-        "-eu_xsl",
-        default=None,
-        help="Path to XSL for eu-regional.xml (default: util/style/eu-regional.xsl).",
-    )
     args = ap.parse_args()
     main(
         args.base_directory,
         args.sequence_number,
         scan=args.scan,
-        mapfile=args.mapfile,
         extract_xml=args.extractXML,
+        mapfile=args.mapfile,
         eu_mapfile=args.eu_mapfile,
-        xsl_path=args.xsl,
-        eu_xsl_path=args.eu_xsl,
     )
