@@ -542,6 +542,40 @@ def _resolve_leaf_file_path(xml_rel_dir: str, href: str) -> str:
     joined = posixpath.join(xml_rel_dir, href)
     return _normalize_seq_relative_path(posixpath.normpath(joined))
 
+def _first_leaf_dir_path(
+    elem,
+    rel_dir: str,
+    seq_dir: Path,
+    modified_href_cache: dict[Path, dict[str, str]],
+) -> str:
+    """Return directory path for the first descendant leaf under elem."""
+    try:
+        leaves = elem.xpath(".//*[local-name()='leaf']")
+    except Exception:
+        leaves = []
+    if not leaves:
+        return ""
+    for leaf in leaves:
+        href = _leaf_href(leaf)
+        file_path = ""
+        if href and not href.lower().endswith(".xml"):
+            file_path = _resolve_leaf_file_path(rel_dir, href)
+        if not file_path:
+            modified_file = (leaf.get("modified-file") or "").strip()
+            if modified_file:
+                modified_href = _resolve_modified_href(seq_dir, modified_file, modified_href_cache)
+                if modified_href and not modified_href.lower().endswith(".xml"):
+                    file_path = _resolve_leaf_file_path(rel_dir, modified_href)
+        if not file_path:
+            continue
+        dir_path = posixpath.dirname(file_path)
+        if not dir_path:
+            continue
+        if not dir_path.endswith("/"):
+            dir_path += "/"
+        return dir_path
+    return ""
+
 def _collect_toc_ancestors(root) -> set[int]:
     """Return IDs of all elements that are ancestors of any leaf."""
     toc_ancestors: set[int] = set()
@@ -672,6 +706,8 @@ def _extract_rows_from_xml(
         local = _local_name(getattr(elem, "tag", ""))
         if not local or local == "title":
             continue
+        if elem.getparent() is None:
+            continue
         if local == "leaf":
             row = _leaf_row_from_elem(elem, seq_dir, rel_dir, modified_href_cache)
             if row:
@@ -684,7 +720,7 @@ def _extract_rows_from_xml(
         attrs_text = _format_attrs_for_metadata(dict(elem.attrib))
         if not attrs_text:
             continue
-        dir_path = _branch_directory_path(elem, base_prefix=rel_dir if rel_dir else None)
+        dir_path = _first_leaf_dir_path(elem, rel_dir, seq_dir, modified_href_cache)
         if not dir_path:
             continue
         dir_path = _normalize_seq_relative_path(dir_path)
@@ -731,6 +767,8 @@ def extract_xml_to_metadata(seq_dir: Path, xlsx_path: Path) -> int:
         local = _local_name(getattr(elem, "tag", ""))
         if not local or local == "title":
             continue
+        if elem.getparent() is None:
+            continue
         if local == "leaf":
             href = _leaf_href(elem)
             href_path = href.split("#", 1)[0] if href else ""
@@ -763,7 +801,7 @@ def extract_xml_to_metadata(seq_dir: Path, xlsx_path: Path) -> int:
         attrs_text = _format_attrs_for_metadata(dict(elem.attrib))
         if not attrs_text:
             continue
-        dir_path = _branch_directory_path(elem, base_prefix=None)
+        dir_path = _first_leaf_dir_path(elem, index_rel_dir, seq_dir, modified_href_cache)
         if not dir_path and id(elem) not in index_toc_ancestors:
             dir_path = ""
         if not dir_path and id(elem) in index_toc_ancestors:
@@ -783,9 +821,18 @@ def extract_xml_to_metadata(seq_dir: Path, xlsx_path: Path) -> int:
     if eu_fields and rows:
         rows[0].update({k: v for k, v in eu_fields.items() if v})
 
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "metadata"
+    if xlsx_path.exists():
+        wb = openpyxl.load_workbook(xlsx_path)
+        if "metadata" in wb.sheetnames:
+            ws = wb["metadata"]
+        else:
+            ws = wb.active
+            ws.title = "metadata"
+        ws.delete_rows(1, ws.max_row)
+    else:
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "metadata"
     ws.append(METADATA_FIELDS)
     for row in rows:
         ws.append([row.get(field, "") for field in METADATA_FIELDS])
