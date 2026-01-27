@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Sebastian Scala
+# SPDX-License-Identifier: GPL-3.0-or-later
 """
 ema_ectd_backbone_generator.py
 Generates and validates eCTD 3.2 and EU M1 3.1 compliant XML backbones.
@@ -17,7 +19,7 @@ from pathlib import Path
 from typing import TypedDict, Optional
 from lxml import etree
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 # Configure logging
 logger = logging.getLogger(__name__)

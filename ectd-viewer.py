@@ -1,6 +1,7 @@
-
+# SPDX-FileCopyrightText: 2026 Sebastian Scala
+# SPDX-License-Identifier: GPL-3.0-or-later
 """
-eCTD Viewer (Extended)
+eCTD Viewer
 =====================
 
 Desktop viewer for eCTD Dossiers (v3.x Backbones) with cross-platform GUI (PySide6/Qt).
@@ -39,7 +40,7 @@ python ectd_viewer.py
 
 from __future__ import annotations
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 import re
 import html
@@ -549,7 +550,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(f"eCTD Viewer (Extended) v{__version__}")
+        self.setWindowTitle(f"eCTD Viewer v{__version__}")
 
         self.dossier: Optional[EctdDossier] = None
         self.dossier_root: Optional[Path] = None
@@ -681,6 +682,9 @@ class MainWindow(QMainWindow):
         tabs.addTab(tab_ver, "Versions")
 
         splitter = QSplitter()
+        splitter.setChildrenCollapsible(False)
+        self.tree.setMinimumWidth(100)
+        tabs.setMinimumWidth(100)
         splitter.addWidget(self.tree)
         splitter.addWidget(tabs)
         splitter.setStretchFactor(0, 4)
