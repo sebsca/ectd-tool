@@ -716,13 +716,65 @@ def _extract_rows_from_xml_in_order(
     base_prefix: str | None,
     attr_map: dict[str, set[str]] | None,
     cache: dict[Path, dict[str, str]],
+    attr_map_for_ref=None,
 ) -> list[dict[str, str]]:
     """Extract leaf and attribute-bearing branch rows in document order."""
     if not xml_path.exists():
         return []
     rows: list[dict[str, str]] = []
+    branch_seen: set[tuple[str, str, str]] = set()
     xml = etree.parse(xml_path)
     root = xml.getroot()
+
+    def _branch_rows_from_modified_leaf(leaf) -> list[dict[str, str]]:
+        modified_file = leaf.get("modified-file") or ""
+        rel_path, leaf_id = _parse_modified_file_ref(modified_file)
+        if rel_path is None or not leaf_id:
+            return []
+        ref_attr_map = attr_map_for_ref(rel_path) if attr_map_for_ref else attr_map
+        xml_ref_path = (seq_dir / rel_path)
+        if not xml_ref_path.exists():
+            return []
+        try:
+            ref_xml = etree.parse(str(xml_ref_path))
+        except OSError:
+            return []
+        try:
+            matches = ref_xml.xpath("//*[local-name()='leaf' and @ID=$id]", id=leaf_id)
+        except Exception:
+            matches = []
+        if not matches:
+            return []
+        node = matches[0].getparent()
+        if node is None:
+            return []
+        ancestors = []
+        cur = node
+        while cur is not None and cur.getparent() is not None:
+            ancestors.append(cur)
+            cur = cur.getparent()
+        ancestors.reverse()
+        out: list[dict[str, str]] = []
+        for anc in ancestors:
+            attrs = _collect_allowed_attrs(anc, ref_attr_map)
+            if not attrs:
+                continue
+            branch_path = _branch_directory_path(anc, base_prefix)
+            if not branch_path:
+                continue
+            row = {
+                "file_path": branch_path,
+                "title": _local_name(anc.tag),
+                "operation": "new",
+                "ctd_toc": _ctd_toc_for_node(anc),
+                "attributes": _format_attrs(attrs),
+            }
+            key = _row_key(row["file_path"], row["attributes"], row["ctd_toc"])
+            if key in branch_seen:
+                continue
+            branch_seen.add(key)
+            out.append(row)
+        return out
 
     for node in root.iter():
         local = _local_name(getattr(node, "tag", ""))
@@ -731,6 +783,9 @@ def _extract_rows_from_xml_in_order(
 
         if local == "leaf":
             leaf = node
+            operation = (leaf.get("operation") or "new").strip().lower()
+            if operation == "delete":
+                rows.extend(_branch_rows_from_modified_leaf(leaf))
             rows.append(_leaf_row_from_leaf(leaf, seq_dir, base_prefix, cache))
             continue
 
@@ -834,6 +889,58 @@ def extract_metadata_from_xml(seq_dir: Path, xlsx_path: Path) -> tuple[int, int,
     extracted_rows: list[dict[str, str]] = []
     regional_cache: dict[Path, list[dict[str, str]]] = {}
     referenced_regionals: list[Path] = []
+    branch_seen: set[tuple[str, str, str]] = set()
+
+    def _branch_rows_from_modified_leaf(leaf) -> list[dict[str, str]]:
+        modified_file = leaf.get("modified-file") or ""
+        rel_path, leaf_id = _parse_modified_file_ref(modified_file)
+        if rel_path is None or not leaf_id:
+            return []
+        ref_xml_path = (seq_dir / rel_path)
+        if not ref_xml_path.exists():
+            return []
+        ref_attr_map = eu_attr_map if ref_xml_path.name == "eu-regional.xml" else ich_attr_map
+        base_prefix = "m1/eu" if ref_xml_path.name == "eu-regional.xml" else None
+        try:
+            ref_xml = etree.parse(str(ref_xml_path))
+        except OSError:
+            return []
+        try:
+            matches = ref_xml.xpath("//*[local-name()='leaf' and @ID=$id]", id=leaf_id)
+        except Exception:
+            matches = []
+        if not matches:
+            return []
+        node = matches[0].getparent()
+        if node is None:
+            return []
+        ancestors = []
+        cur = node
+        while cur is not None and cur.getparent() is not None:
+            ancestors.append(cur)
+            cur = cur.getparent()
+        ancestors.reverse()
+        out: list[dict[str, str]] = []
+        for anc in ancestors:
+            attrs = _collect_allowed_attrs(anc, ref_attr_map)
+            if not attrs:
+                continue
+            branch_path = _branch_directory_path(anc, base_prefix)
+            if not branch_path:
+                continue
+            row = {
+                "file_path": branch_path,
+                "title": _local_name(anc.tag),
+                "operation": "new",
+                "ctd_toc": _ctd_toc_for_node(anc),
+                "attributes": _format_attrs(attrs),
+            }
+            key = _row_key(row["file_path"], row["attributes"], row["ctd_toc"])
+            if key in branch_seen:
+                continue
+            branch_seen.add(key)
+            out.append(row)
+        return out
 
     def _regional_rows_for_href(href: str) -> list[dict[str, str]]:
         regional_path = (seq_dir / href).resolve()
@@ -852,6 +959,7 @@ def extract_metadata_from_xml(seq_dir: Path, xlsx_path: Path) -> tuple[int, int,
             base_prefix=base_prefix,
             attr_map=eu_attr_map,
             cache=cache,
+            attr_map_for_ref=lambda p: eu_attr_map if p.name == "eu-regional.xml" else ich_attr_map,
         )
         regional_cache[regional_path] = regional_rows
         referenced_regionals.append(regional_path)
@@ -863,6 +971,9 @@ def extract_metadata_from_xml(seq_dir: Path, xlsx_path: Path) -> tuple[int, int,
             continue
 
         if local == "leaf":
+            operation = (node.get("operation") or "new").strip().lower()
+            if operation == "delete":
+                extracted_rows.extend(_branch_rows_from_modified_leaf(node))
             extracted_rows.append(_leaf_row_from_leaf(node, seq_dir, base_prefix=None, cache=cache))
             href = _leaf_href(node)
             if href.lower().endswith(".xml") and href.lower() != "index.xml":
@@ -1654,7 +1765,13 @@ def create_index_xml(
     def _new_leaf_id() -> str:
         return f"N{uuid.uuid4().hex}"
 
-    def _add_leaf(parent, row, file_path: str, href_override: str | None = None):
+    def _add_leaf(
+        parent,
+        row,
+        file_path: str,
+        href_override: str | None = None,
+        prev_ref_filter=None,
+    ):
         operation = (row.get("operation") or "new").strip().lower()
         modified_href = (row.get("modified-href") or "").strip() or None
         modified_leaf = (row.get("modified-leaf") or "").strip() or None
@@ -1698,6 +1815,14 @@ def create_index_xml(
                 hint = modified_leaf or modified_href or file_path
                 print(f"⚠ No previous leaf found for {operation} operation on {hint}")
                 prev_refs = [None]
+            if prev_ref_filter and prev_refs:
+                filtered = [ref for ref in prev_refs if ref and prev_ref_filter(ref)]
+                if filtered:
+                    prev_refs = filtered
+                else:
+                    hint = modified_leaf or modified_href or file_path
+                    print(f"⚠ No previous leaf matched TOC context for {operation} operation on {hint}")
+                    prev_refs = [None]
 
         order = _order_for_parent(order_map, parent.tag)
         insert_idx = None
@@ -1847,13 +1972,75 @@ def create_index_xml(
             cur = _ensure_child(cur, tag)
         return cur
 
+    def _module_key_from_ctd(ctd_toc: str) -> str | None:
+        if not ctd_toc:
+            return None
+        match = re.match(r"m[1-5]\b", ctd_toc.strip())
+        if match:
+            return match.group(0)
+        return None
+
+    prev_index_cache: dict[int, etree._ElementTree] = {}
+    prev_leaf_cache: dict[tuple[int, str], tuple[list[str], list[dict[str, str]]]] = {}
+
+    def _load_prev_index(prev_seq: int) -> etree._ElementTree | None:
+        if prev_seq in prev_index_cache:
+            return prev_index_cache[prev_seq]
+        index_path = base_dir / f"{prev_seq:04d}" / "index.xml"
+        if not index_path.exists():
+            return None
+        try:
+            xml = etree.parse(str(index_path))
+        except Exception:
+            return None
+        prev_index_cache[prev_seq] = xml
+        return xml
+
+    def _prev_leaf_path(prev_seq: int, leaf_id: str) -> tuple[list[str], list[dict[str, str]]] | None:
+        if not leaf_id:
+            return None
+        cache_key = (prev_seq, leaf_id)
+        if cache_key in prev_leaf_cache:
+            return prev_leaf_cache[cache_key]
+        xml = _load_prev_index(prev_seq)
+        if xml is None:
+            return None
+        try:
+            matches = xml.xpath("//*[local-name()='leaf' and @ID=$id]", id=leaf_id)
+        except Exception:
+            matches = []
+        if not matches:
+            return None
+        node = matches[0].getparent()
+        tags: list[str] = []
+        attrs: list[dict[str, str]] = []
+        while node is not None and node.getparent() is not None:
+            tags.append(node.tag.split("}", 1)[-1])
+            attrs.append(dict(node.attrib))
+            node = node.getparent()
+        tags.reverse()
+        attrs.reverse()
+        if tags:
+            tags = tags[1:]
+            attrs = attrs[1:]
+        if not tags:
+            return None
+        prev_leaf_cache[cache_key] = (tags, attrs)
+        return prev_leaf_cache[cache_key]
+
     eu_rows = []
     rows_by_module: dict[str, list[dict]] = {k: [] for k in module_map}
     for row in metadata_rows:
         operation = (row.get("operation") or "new").strip().lower()
         file_path = (row.get("file_path") or "").strip()
+        ctd_toc = (row.get("CTD-TOC") or row.get("ctd_toc") or row.get("ctd-toc") or "").strip()
+        module_key_override: str | None = None
         if not file_path:
-            if operation == "delete":
+            if ctd_toc:
+                module_key_override = _module_key_from_ctd(ctd_toc)
+                if not module_key_override:
+                    raise ValueError("TOC row requires ctd_toc starting with module key (m1-m5).")
+            elif operation == "delete":
                 modified_href = (row.get("modified-href") or "").strip()
                 modified_leaf = (row.get("modified-leaf") or "").strip()
                 if modified_href:
@@ -1868,10 +2055,12 @@ def create_index_xml(
                 raise ValueError("CSV row is missing required column 'file_path'")
         row_copy = dict(row)
         row_copy["file_path"] = file_path
+        if module_key_override:
+            row_copy["_module_key"] = module_key_override
         if file_path.startswith("m1/eu/") and file_path != "m1/eu/eu-regional.xml":
             eu_rows.append(row_copy)
             continue
-        module_key = file_path.split("/", 1)[0]
+        module_key = row_copy.get("_module_key") or file_path.split("/", 1)[0]
         if module_key in rows_by_module:
             rows_by_module[module_key].append(row_copy)
 
@@ -1897,6 +2086,9 @@ def create_index_xml(
             if not file_path:
                 continue
             is_dir_path = _is_directory_path(seq_dir, file_path)
+            ctd_toc = (row.get("CTD-TOC") or row.get("ctd_toc") or row.get("ctd-toc") or "").strip()
+            if ctd_toc and is_dir_path:
+                continue
             if not is_dir_path:
                 continue
             dir_rows.append(row)
@@ -1940,22 +2132,60 @@ def create_index_xml(
             dir_infos.append({"parts": dir_parts, "tags": tags, "elem": dir_elem})
         if dir_infos:
             dir_infos.sort(key=lambda d: len(d["parts"]), reverse=True)
+        toc_stack: list[dict[str, object]] = []
         for row in rows:
             file_path = (row.get("file_path") or "").strip()
-            if not file_path:
-                continue
             ctd_toc = (row.get("CTD-TOC") or row.get("ctd_toc") or row.get("ctd-toc") or "").strip()
+            if not file_path and not ctd_toc:
+                continue
+            operation = (row.get("operation") or "new").strip().lower()
             custom_attrs = _parse_custom_attributes(row.get("attributes") or "")
             is_dir_path = _is_directory_path(seq_dir, file_path)
             file_parts = [p for p in file_path.strip("/").split("/") if p]
             tags = _tags_for_row(module_elem.tag, file_path, ctd_toc, is_dir_path, module_key)
-            base_elem = module_elem
-            remaining_tags = tags[:]
+            is_toc_row = bool(ctd_toc) and (not file_path or is_dir_path)
+            allow_equal = not is_toc_row
+            while toc_stack:
+                ctx_tags = toc_stack[-1]["tags"]
+                if tags[: len(ctx_tags)] == ctx_tags and (allow_equal or len(ctx_tags) < len(tags)):
+                    break
+                toc_stack.pop()
+
+            base_tags = toc_stack[-1]["tags"] if toc_stack else []
+            base_elem = toc_stack[-1]["elem"] if toc_stack else module_elem
+            remaining_tags = tags[len(base_tags):]
+
+            if is_toc_row:
+                target_tag = tags[-1] if tags else module_elem.tag
+                allowed_attrs = _allowed_attrs_for_element(attr_map, target_tag)
+                filtered_attrs = _filter_allowed_attrs(
+                    custom_attrs,
+                    allowed_attrs,
+                    file_path,
+                    target_tag,
+                )
+                normalized = {_normalize_attr_name(k): v for k, v in filtered_attrs.items()}
+                if tags:
+                    toc_elem = _ensure_path_by_tags(
+                        base_elem,
+                        remaining_tags,
+                        last_attrib=normalized if normalized else None,
+                    )
+                else:
+                    if normalized:
+                        for k, v in normalized.items():
+                            module_elem.set(k, v)
+                    toc_elem = module_elem
+                toc_stack.append({"tags": tags[:], "elem": toc_elem, "attrs": normalized})
+                continue
+
             for info in dir_infos:
                 parts = info["parts"]
                 if len(parts) <= len(file_parts) and file_parts[: len(parts)] == parts:
                     dir_tags = info["tags"]
                     if tags[: len(dir_tags)] == dir_tags:
+                        if base_tags and dir_tags[: len(base_tags)] != base_tags:
+                            continue
                         base_elem = info["elem"]
                         remaining_tags = tags[len(dir_tags):]
                         break
@@ -1979,7 +2209,35 @@ def create_index_xml(
                     else:
                         toc_parent = _ensure_child(parent, toc_parent.tag, attrib=merged)
             if not is_dir_path:
-                _add_leaf(toc_parent, row, file_path)
+                prev_ref_filter = None
+                if operation == "delete" and toc_stack:
+                    constraints = [(ctx["tags"], ctx.get("attrs") or {}) for ctx in toc_stack]
+
+                    def _matches_context(prev_ref):
+                        prev_seq, prev_xml_path, prev_id, _prev_href = prev_ref
+                        if Path(prev_xml_path).name != "index.xml":
+                            return False
+                        prev_ctx = _prev_leaf_path(prev_seq, prev_id)
+                        if not prev_ctx:
+                            return False
+                        prev_tags, prev_attrs = prev_ctx
+                        for ctx_tags, ctx_attrs in constraints:
+                            if not ctx_tags:
+                                continue
+                            if prev_tags[: len(ctx_tags)] != ctx_tags:
+                                return False
+                            if ctx_attrs:
+                                idx = len(ctx_tags) - 1
+                                if idx >= len(prev_attrs):
+                                    return False
+                                prev_at = prev_attrs[idx]
+                                for k, v in ctx_attrs.items():
+                                    if prev_at.get(k) != v:
+                                        return False
+                        return True
+
+                    prev_ref_filter = _matches_context
+                _add_leaf(toc_parent, row, file_path, prev_ref_filter=prev_ref_filter)
 
     xml_path = seq_dir / "index.xml"
     if xsl_path is None:
@@ -2067,7 +2325,13 @@ def create_eu_regional_xml(
     def _new_leaf_id() -> str:
         return f"N{uuid.uuid4().hex}"
 
-    def _add_leaf(parent, row, file_path: str, href_override: str):
+    def _add_leaf(
+        parent,
+        row,
+        file_path: str,
+        href_override: str,
+        prev_ref_filter=None,
+    ):
         operation = (row.get("operation") or "new").strip().lower()
         modified_href = (row.get("modified-href") or "").strip() or None
         modified_leaf = (row.get("modified-leaf") or "").strip() or None
@@ -2112,6 +2376,14 @@ def create_eu_regional_xml(
                 hint = modified_leaf or modified_href or file_path
                 print(f"⚠ No previous leaf found for {operation} operation on {hint}")
                 prev_refs = [None]
+            if prev_ref_filter and prev_refs:
+                filtered = [ref for ref in prev_refs if ref and prev_ref_filter(ref)]
+                if filtered:
+                    prev_refs = filtered
+                else:
+                    hint = modified_leaf or modified_href or file_path
+                    print(f"⚠ No previous leaf matched TOC context for {operation} operation on {hint}")
+                    prev_refs = [None]
 
         for prev_ref in prev_refs:
             leaf_attrs = dict(attrs)
@@ -2374,6 +2646,70 @@ def create_eu_regional_xml(
             return "pi-doc"
         return "leaf"
 
+    prev_xml_cache: dict[tuple[int, str], etree._ElementTree] = {}
+    prev_leaf_cache: dict[tuple[int, str, str], tuple[list[str], list[dict[str, str]]]] = {}
+
+    def _load_prev_xml(prev_seq: int, rel_path: str) -> etree._ElementTree | None:
+        key = (prev_seq, rel_path)
+        if key in prev_xml_cache:
+            return prev_xml_cache[key]
+        xml_path = seq_dir.parent / f"{prev_seq:04d}" / rel_path
+        if not xml_path.exists():
+            return None
+        try:
+            xml = etree.parse(str(xml_path))
+        except Exception:
+            return None
+        prev_xml_cache[key] = xml
+        return xml
+
+    def _prev_leaf_path(prev_seq: int, prev_xml_path: str, leaf_id: str) -> tuple[list[str], list[dict[str, str]]] | None:
+        if not leaf_id:
+            return None
+        cache_key = (prev_seq, prev_xml_path, leaf_id)
+        if cache_key in prev_leaf_cache:
+            return prev_leaf_cache[cache_key]
+        xml = _load_prev_xml(prev_seq, prev_xml_path)
+        if xml is None:
+            return None
+        try:
+            matches = xml.xpath("//*[local-name()='leaf' and @ID=$id]", id=leaf_id)
+        except Exception:
+            matches = []
+        if not matches:
+            return None
+        node = matches[0].getparent()
+        tags: list[str] = []
+        attrs: list[dict[str, str]] = []
+        while node is not None and node.getparent() is not None:
+            tags.append(node.tag.split("}", 1)[-1])
+            attrs.append(dict(node.attrib))
+            node = node.getparent()
+        tags.reverse()
+        attrs.reverse()
+        if tags:
+            tags = tags[1:]
+            attrs = attrs[1:]
+        if not tags:
+            return None
+        prev_leaf_cache[cache_key] = (tags, attrs)
+        return prev_leaf_cache[cache_key]
+
+    def _element_path_with_attrs(elem) -> tuple[list[str], list[dict[str, str]]]:
+        tags: list[str] = []
+        attrs: list[dict[str, str]] = []
+        node = elem
+        while node is not None and node.getparent() is not None:
+            tags.append(node.tag.split("}", 1)[-1])
+            attrs.append(dict(node.attrib))
+            node = node.getparent()
+        tags.reverse()
+        attrs.reverse()
+        if tags:
+            tags = tags[1:]
+            attrs = attrs[1:]
+        return tags, attrs
+
     def _mapped_section_tags(file_path: str) -> tuple[str | None, str | None]:
         if not dir_mapping_index and not file_mapping_index:
             return None, None
@@ -2469,6 +2805,7 @@ def create_eu_regional_xml(
 
     for row in eu_rows:
         file_path = (row.get("file_path") or "").strip()
+        operation = (row.get("operation") or "new").strip().lower()
         rel_path = file_path[len("m1/eu/"):]
         parts = [p for p in rel_path.split("/") if p]
         if not parts:
@@ -2534,18 +2871,42 @@ def create_eu_regional_xml(
                         container.set(k, v)
 
         if not is_dir_path:
-            _add_leaf(container, row, file_path, rel_path)
+            prev_ref_filter = None
+            if operation == "delete":
+                ctx_tags, ctx_attrs = _element_path_with_attrs(container)
+
+                def _matches_context(prev_ref):
+                    prev_seq, prev_xml_path, prev_id, _prev_href = prev_ref
+                    prev_ctx = _prev_leaf_path(prev_seq, prev_xml_path, prev_id)
+                    if not prev_ctx:
+                        return False
+                    prev_tags, prev_attrs = prev_ctx
+                    if ctx_tags and prev_tags[: len(ctx_tags)] != ctx_tags:
+                        return False
+                    for idx, attrs in enumerate(ctx_attrs):
+                        if not attrs:
+                            continue
+                        if idx >= len(prev_attrs):
+                            return False
+                        prev_at = prev_attrs[idx]
+                        for k, v in attrs.items():
+                            if prev_at.get(k) != v:
+                                return False
+                    return True
+
+                prev_ref_filter = _matches_context
+            _add_leaf(container, row, file_path, rel_path, prev_ref_filter=prev_ref_filter)
 
     m1_eu_dir = seq_dir / "m1" / "eu"
     m1_eu_dir.mkdir(parents=True, exist_ok=True)
     xml_path = m1_eu_dir / "eu-regional.xml"
 
     if xsl_path is None:
-        xsl_path = (UTIL_STYLE_DIR / EU_XSL_FILENAME).as_posix()
+        xsl_path = (Path("..") / ".." / UTIL_STYLE_DIR / EU_XSL_FILENAME).as_posix()
     doctype = _build_doctype(
         root_name,
         (Path("..") / ".." / UTIL_DTD_DIR / EU_DTD_FILENAME).as_posix(),
-        dtd_info.get("public_id") or "",
+        "",
     )
     write_xml_with_doctype_and_xsl(
         xml_path,
