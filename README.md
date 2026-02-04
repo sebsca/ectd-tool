@@ -9,12 +9,14 @@ Command-line tool to generate `index.xml` (ICH 3.2) and `m1/eu/eu-regional.xml` 
 
 #### Usage
 ```bash
-python ectd-tool.py <base_directory> <sequence_number> [-scan] [-extractXML] [-mapfile PATH] [-eu_mapfile PATH]
+python ectd-tool.py <base_directory> <sequence_number> [-scan] [-extractXML] [-metadata PATH] [-mapfile PATH] [-eu_mapfile PATH]
 ```
 
 #### Metadata (metadata-\<seq>.xlsx)
-- The tool expects an Excel workbook named `metadata-<seq>.xlsx` in the base directory, with a
-  `metadata` sheet as the first/active sheet.
+- By default, the tool expects an Excel workbook named `metadata-<seq>.xlsx` in the base directory,
+  with a `metadata` sheet as the first/active sheet.
+- Use `-metadata PATH` to override the metadata file path or filename (relative paths are resolved
+  against the base directory).
 - `file_path` values are relative to the sequence directory (for example: `m1/12/cover.pdf`).
 - Required columns: `file_path`, `title`, `operation`, `modified-leaf`, `modified-href`
 - Optional columns: `ctd_toc` (override target XML element tag for a file),
@@ -35,7 +37,8 @@ python ectd-tool.py <base_directory> <sequence_number> [-scan] [-extractXML] [-m
 
 #### Extract from XML
 `-extractXML` reads `index.xml` and any referenced regional XML files (for example
-`m1/eu/eu-regional.xml`) and transfers the information into `metadata-<seq>.xlsx`.
+`m1/eu/eu-regional.xml`) and transfers the information into the metadata Excel file
+(default: `metadata-<seq>.xlsx`, or the path provided by `-metadata`).
 It creates rows for every leaf and for every branch that has attributes, and preserves
 the XML order (regional XML content appears where it is referenced in `index.xml`).
 

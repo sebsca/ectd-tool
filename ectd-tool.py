@@ -2851,20 +2851,27 @@ def main(
     extract_xml: bool = False,
     mapfile: str | None = None,
     eu_mapfile: str | None = None,
+    metadata_path: str | None = None,
 ):
     base = Path(base_dir)
     raw_sequence = (sequence_num or "").strip()
     padded_sequence = f"{int(raw_sequence):04d}" if raw_sequence.isdigit() else raw_sequence
 
     seq_dir = base / raw_sequence
-    xlsx_file = base / f"metadata-{raw_sequence}.xlsx"
+    if metadata_path:
+        xlsx_file = Path(metadata_path)
+        if not xlsx_file.is_absolute():
+            xlsx_file = base / xlsx_file
+    else:
+        xlsx_file = base / f"metadata-{raw_sequence}.xlsx"
     sequence_for_paths = raw_sequence
 
     padded_seq_dir = base / padded_sequence
     if not seq_dir.exists() and padded_sequence != raw_sequence and padded_seq_dir.exists():
         sequence_for_paths = padded_sequence
         seq_dir = padded_seq_dir
-        xlsx_file = base / f"metadata-{sequence_for_paths}.xlsx"
+        if not metadata_path:
+            xlsx_file = base / f"metadata-{sequence_for_paths}.xlsx"
         logger.info(f"Using zero-padded sequence directory: {sequence_for_paths}")
 
     mapping_path = Path(mapfile) if mapfile else None
@@ -2968,6 +2975,15 @@ if __name__ == "__main__":
             "Required columns: item_type (directory|file), relative_path, xml_element."
         ),
     )
+    ap.add_argument(
+        "-metadata",
+        default=None,
+        help=(
+            "Path to metadata Excel file "
+            "(default: metadata-<seq>.xlsx in base_directory). "
+            "Relative paths are resolved against base_directory."
+        ),
+    )
     args = ap.parse_args()
     main(
         args.base_directory,
@@ -2976,4 +2992,5 @@ if __name__ == "__main__":
         extract_xml=args.extractXML,
         mapfile=args.mapfile,
         eu_mapfile=args.eu_mapfile,
+        metadata_path=args.metadata,
     )

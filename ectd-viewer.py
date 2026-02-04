@@ -44,6 +44,7 @@ __version__ = "0.1.1"
 
 import re
 import html
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
@@ -565,6 +566,9 @@ class MainWindow(QMainWindow):
         self.expand_seq_btn = QPushButton("Expand Sequence")
         self.expand_seq_btn.clicked.connect(self.expand_selected_sequence)
 
+        self.export_cons_btn = QPushButton("Export Consolidated…")
+        self.export_cons_btn.clicked.connect(self.export_consolidated_current_sequence)
+
         self.toc_cb = QCheckBox("CTD-TOC Tree (instead of Filesystem)")
         self.toc_cb.stateChanged.connect(self.on_toc_toggle)
 
@@ -581,6 +585,7 @@ class MainWindow(QMainWindow):
         tl.addWidget(self.open_btn)
         tl.addWidget(self.expand_seq_btn)
         tl.addWidget(self.collapse_btn)
+        tl.addWidget(self.export_cons_btn)
         tl.addWidget(self.toc_cb)
         tl.addWidget(self.consolidated_cb)
         tl.addWidget(self.show_backbone_docs_cb)
@@ -1367,6 +1372,22 @@ class MainWindow(QMainWindow):
         lr = it.data(ROLE_LEAF)
         return lr if isinstance(lr, LeafRecord) else None
 
+    def _selected_sequence(self) -> Optional[str]:
+        it = self._selected_source_item()
+        if not it:
+            return None
+        info = it.data(ROLE_NODEINFO) or {}
+        if info.get("kind") == "sequence":
+            return info.get("seq") or None
+        lr = it.data(ROLE_LEAF)
+        if isinstance(lr, LeafRecord):
+            return lr.sequence
+        seq_item = self._find_sequence_item(it)
+        if not seq_item:
+            return None
+        info = seq_item.data(ROLE_NODEINFO) or {}
+        return info.get("seq") or None
+
     def _overview_html(self, text: str) -> str:
         lines = text.splitlines()
         html_lines: List[str] = []
@@ -1506,7 +1527,7 @@ class MainWindow(QMainWindow):
             seen.add(cur)
             p = cur.resolved_open_path()
             exists = p.exists() if p else False
-            rows.append([f"{depth:02d}", cur.sequence, cur.operation, str(exists), str(p or "")])
+            rows.insert(0,[f"{depth:02d}", cur.sequence, cur.operation, str(exists), str(p or "")])
             cur = cur.prev_leaf
             depth += 1
         if cur in seen:
@@ -1518,12 +1539,10 @@ class MainWindow(QMainWindow):
         self.versions_table.resizeColumnToContents(0)
 
     def on_versions_double_click(self, row: int, column: int):
-        if column != 4:
+        path_item = self.versions_table.item(row, 4)
+        if not path_item:
             return
-        item = self.versions_table.item(row, column)
-        if not item:
-            return
-        path_str = (item.text() or "").strip()
+        path_str = (path_item.text() or "").strip()
         if not path_str:
             return
         path = Path(path_str)
@@ -1618,6 +1637,144 @@ class MainWindow(QMainWindow):
         p = lr.resolved_open_path()
         if p:
             QApplication.clipboard().setText(str(p))
+
+    def export_consolidated_current_sequence(self):
+        if not self.dossier or not self.dossier_root:
+            QMessageBox.warning(self, "No Dossier", "Open a dossier first.")
+            return
+        seq = self._selected_sequence()
+        if not seq:
+            QMessageBox.information(
+                self,
+                "No Sequence Selected",
+                "Select a sequence (or any item within a sequence) in the tree first.",
+            )
+            return
+
+        default_dir = self.dossier_root / f"{seq}-consolidated"
+        out_path_str, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Consolidated Dossier",
+            str(default_dir),
+        )
+        if not out_path_str:
+            return
+        out_path = Path(out_path_str)
+        if out_path.exists() and out_path.is_file():
+            QMessageBox.critical(self, "Invalid Path", "Selected path points to a file.")
+            return
+        if out_path.exists():
+            try:
+                has_contents = any(out_path.iterdir())
+            except Exception:
+                has_contents = False
+            if has_contents:
+                choice = QMessageBox.question(
+                    self,
+                    "Folder Not Empty",
+                    "The selected folder is not empty. Continue and overwrite files?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                if choice != QMessageBox.Yes:
+                    return
+        try:
+            out_path.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            QMessageBox.critical(self, "Export Failed", f"Could not create output folder:\n{e}")
+            return
+
+        leaves = self.dossier.get_consolidated(seq)
+        if not leaves:
+            QMessageBox.information(self, "No Files", f"No consolidated leaves for sequence {seq}.")
+            return
+
+        backbone_paths: Set[Path] = set()
+        for bbs in self.dossier.backbones_by_seq.values():
+            for bb in bbs:
+                backbone_paths.add(bb.xml_path.resolve())
+
+        def seq_key(s: str):
+            return int(s) if s.isdigit() else s
+
+        leaves_sorted = sorted(
+            leaves,
+            key=lambda lr: (seq_key(lr.sequence), lr.href or "", lr.leaf_id or ""),
+        )
+
+        copied = 0
+        missing = 0
+        skipped = 0
+        skipped_backbone = 0
+        renamed = 0
+        seen_dest: Set[str] = set()
+        errors: List[str] = []
+
+        for lr in leaves_sorted:
+            src = lr.resolved_open_path()
+            if not src or not src.exists():
+                missing += 1
+                continue
+            if src.resolve() in backbone_paths:
+                skipped_backbone += 1
+                continue
+
+            try:
+                rel = str(src.relative_to(self.dossier_root / lr.sequence))
+            except Exception:
+                rel = src.name
+
+            rel_path = Path(rel)
+            if rel_path.is_absolute() or ".." in rel_path.parts:
+                skipped += 1
+                continue
+
+            dest = out_path / rel_path
+            dest_key = str(dest)
+            if dest_key in seen_dest or dest.exists():
+                stem = dest.stem
+                suffix = dest.suffix
+                seq_suffix = f"-{lr.sequence}"
+                alt = dest.with_name(f"{stem}{seq_suffix}{suffix}")
+                if str(alt) in seen_dest or alt.exists():
+                    i = 2
+                    while True:
+                        alt = dest.with_name(f"{stem}{seq_suffix}-{i}{suffix}")
+                        if str(alt) not in seen_dest and not alt.exists():
+                            break
+                        i += 1
+                dest = alt
+                dest_key = str(dest)
+                renamed += 1
+            seen_dest.add(dest_key)
+            try:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dest)
+                copied += 1
+            except Exception as e:
+                errors.append(f"{rel}: {e}")
+                skipped += 1
+
+        msg_lines = [
+            f"Sequence: {seq}",
+            f"Copied files: {copied}",
+        ]
+        if missing:
+            msg_lines.append(f"Missing files: {missing}")
+        if skipped_backbone:
+            msg_lines.append(f"Skipped backbone XMLs: {skipped_backbone}")
+        if renamed:
+            msg_lines.append(f"Renamed due to collisions: {renamed}")
+        if skipped:
+            msg_lines.append(f"Skipped files: {skipped}")
+        if errors:
+            msg_lines.append("")
+            msg_lines.append("Errors:")
+            msg_lines.extend(errors[:10])
+            if len(errors) > 10:
+                msg_lines.append(f"... {len(errors) - 10} more")
+
+        QMessageBox.information(self, "Export Completed", "\n".join(msg_lines))
 
     # ---------------- Context menu ----------------
 
