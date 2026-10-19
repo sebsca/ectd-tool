@@ -1,17 +1,78 @@
 {
-    // Use IntelliSense to learn about possible attributes.
-    // Hover to view descriptions of existing attributes.
-    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Python Debugger: Current File with Arguments",
-            "type": "debugpy",
+            "name": "eCTD Viewer (Debug)",
+            "type": "cppdbg",
             "request": "launch",
-            "program": "${file}",
-            "console": "integratedTerminal",
-//            "args": "${command:pickArgs}"
-            "args": "./'Alpro500 eCTD' 0006" 
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "program": "${workspaceFolder}/target/debug/ectd-viewer",
+            "stopAtEntry": false,
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "miDebuggerPath": "${env:HOME}/.cargo/bin/rust-gdb",
+            "preLaunchTask": "cargo build (debug)",
+            "setupCommands": [
+                {
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                }
+            ]
+        },
+        {
+            "name": "eCTD Viewer (Release)",
+            "type": "cppdbg",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "program": "${workspaceFolder}/target/release/ectd-viewer",
+            "stopAtEntry": false,
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "miDebuggerPath": "${env:HOME}/.cargo/bin/rust-gdb",
+            "preLaunchTask": "cargo build (release)",
+            "setupCommands": [
+                {
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                }
+            ]
+        },
+        {
+            "name": "eCTD Tool (Debug)",
+            "type": "cppdbg",
+            "request": "launch",
+            "args": [
+                "${input:dossierPath}",
+                "${input:sequence}"
+            ],
+            "cwd": "${workspaceFolder}",
+            "program": "${workspaceFolder}/target/debug/ectd-tool",
+            "stopAtEntry": false,
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "miDebuggerPath": "${env:HOME}/.cargo/bin/rust-gdb",
+            "preLaunchTask": "cargo build (debug)",
+            "setupCommands": [
+                {
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                }
+            ]
+        }
+    ],
+    "inputs": [
+        {
+            "id": "dossierPath",
+            "type": "promptString",
+            "description": "Dossierordner mit Metadaten und Sequenzverzeichnissen"
+        },
+        {
+            "id": "sequence",
+            "type": "promptString",
+            "description": "Sequenznummer",
+            "default": "0001"
         }
     ]
 }

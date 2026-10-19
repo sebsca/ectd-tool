@@ -1,0 +1,91 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "cargo build (debug)",
+            "type": "process",
+            "command": "cargo",
+            "args": [
+                "build",
+                "--locked",
+                "--bins"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": [
+                "$rustc"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "linux": {
+                "command": "${env:HOME}/.cargo/bin/cargo"
+            }
+        },
+        {
+            "label": "cargo build (release)",
+            "type": "process",
+            "command": "cargo",
+            "args": [
+                "build",
+                "--release",
+                "--locked",
+                "--bins"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": [
+                "$rustc"
+            ],
+            "group": "build",
+            "linux": {
+                "command": "${env:HOME}/.cargo/bin/cargo"
+            }
+        },
+        {
+            "label": "cargo test",
+            "type": "process",
+            "command": "cargo",
+            "args": [
+                "test",
+                "--locked",
+                "--all-targets"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": [
+                "$rustc"
+            ],
+            "group": "test",
+            "linux": {
+                "command": "${env:HOME}/.cargo/bin/cargo"
+            }
+        },
+        {
+            "label": "cargo clippy",
+            "type": "process",
+            "command": "cargo",
+            "args": [
+                "clippy",
+                "--locked",
+                "--all-targets",
+                "--",
+                "-D",
+                "warnings"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": [
+                "$rustc"
+            ],
+            "linux": {
+                "command": "${env:HOME}/.cargo/bin/cargo"
+            }
+        }
+    ]
+}

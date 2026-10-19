@@ -1,0 +1,32 @@
+[package]
+name = "ectd-rust"
+version = "0.1.0"
+edition = "2024"
+description = "Native viewer and backbone generator for eCTD 3.x dossiers"
+license = "GPL-3.0-or-later"
+default-run = "ectd-viewer"
+
+[[bin]]
+name = "ectd-viewer"
+path = "src/main.rs"
+
+[dependencies]
+csv = "1"
+eframe = { version = "0.33", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui_extras = { version = "0.33", default-features = false }
+md5 = "0.8"
+open = "5"
+percent-encoding = "2"
+quick-xml = { version = "0.38", features = ["encoding"] }
+rfd = "0.17"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+umya-spreadsheet = "3.1"
+uuid = { version = "1", features = ["v4"] }
+xmloxide = { version = "0.5", default-features = false }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Render the window title in client-side decorations on GNOME/Wayland.
+winit = { version = "0.30", default-features = false, features = ["wayland-csd-adwaita"] }

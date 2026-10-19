@@ -1,0 +1,20 @@
+<!-- Synthetic EU M1 subset for tests. Local external parameter entity is intentional. -->
+<!ENTITY % countries "at|de|common|ema">
+<!ENTITY % languages "de|en|fr">
+<!ENTITY % envelope SYSTEM "eu-envelope.mod">
+%envelope;
+<!ELEMENT eu:eu-backbone (eu-envelope,m1-eu)>
+<!ATTLIST eu:eu-backbone xmlns:eu CDATA #FIXED "http://europa.eu.int" xmlns:xlink CDATA #FIXED "http://www.w3.org/1999/xlink" dtd-version CDATA #FIXED "3.1">
+<!ELEMENT m1-eu (m1-0-cover?,m1-2-form?,m1-3-pi?,m1-additional-data?)>
+<!ELEMENT m1-0-cover (specific*)>
+<!ELEMENT m1-2-form (specific*)>
+<!ELEMENT m1-3-pi (m1-3-1-spc-label-pl*)>
+<!ELEMENT m1-3-1-spc-label-pl (pi-doc*)>
+<!ELEMENT m1-additional-data (specific*)>
+<!ELEMENT specific (leaf*)>
+<!ATTLIST specific country (%countries;) #REQUIRED>
+<!ELEMENT pi-doc (leaf*)>
+<!ATTLIST pi-doc country (%countries;) #REQUIRED xml:lang (%languages;) #REQUIRED type (spc|pl|combined|other) #REQUIRED>
+<!ELEMENT leaf (title)>
+<!ATTLIST leaf ID ID #REQUIRED checksum CDATA #REQUIRED checksum-type (MD5) #REQUIRED operation (new|replace|append|delete) #REQUIRED xlink:href CDATA #IMPLIED modified-file CDATA #IMPLIED>
+<!ELEMENT title (#PCDATA)>

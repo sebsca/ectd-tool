@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ectd:ectd xmlns:ectd="http://www.ich.org/ectd" xmlns:xlink="http://www.w3.org/1999/xlink">
+  <m3-quality>
+    <m3-2-body-of-data>
+      <m3-2-s-drug-substance substance="Demo substance" manufacturer="Example manufacturer">
+        <leaf ID="substance-deletion" operation="delete" modified-file="../0000/index.xml#substance-v1"><title>Withdrawn drug substance</title></leaf>
+      </m3-2-s-drug-substance>
+    </m3-2-body-of-data>
+  </m3-quality>
+</ectd:ectd>

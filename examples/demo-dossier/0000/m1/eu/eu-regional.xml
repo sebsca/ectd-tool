@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<eu:eu-backbone xmlns:eu="http://europa.eu/ectd" xmlns:xlink="http://www.w3.org/1999/xlink" dtd-version="3.1">
+  <m1-eu>
+    <m1-0-cover>
+      <specific country="at"><leaf ID="cover-at" operation="new" xlink:href="cover.txt"><title>Austrian cover letter</title></leaf></specific>
+    </m1-0-cover>
+    <m1-3-product-information>
+      <pi-doc xml:lang="de" type="sm-pc" country="at"><leaf ID="product-information" operation="new" xlink:href="product-information.txt"><title>Product information</title></leaf></pi-doc>
+    </m1-3-product-information>
+  </m1-eu>
+</eu:eu-backbone>

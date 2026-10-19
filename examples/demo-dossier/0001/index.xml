@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ectd:ectd xmlns:ectd="http://www.ich.org/ectd" xmlns:xlink="http://www.w3.org/1999/xlink">
+  <m2-common-technical-document-summaries>
+    <m2-3-quality-overall-summary>
+      <leaf ID="summary-v2" operation="replace" modified-file="../0000/index.xml#summary-v1" xlink:href="m2/summary.txt"><title>Revised quality overview</title></leaf>
+    </m2-3-quality-overall-summary>
+  </m2-common-technical-document-summaries>
+  <m3-quality>
+    <m3-2-body-of-data>
+      <m3-2-s-drug-substance substance="Demo substance" manufacturer="Example manufacturer">
+        <leaf ID="substance-addendum" operation="append" modified-file="../0000/index.xml#substance-v1" xlink:href="m3/addendum.txt"><title>Drug substance addendum</title></leaf>
+      </m3-2-s-drug-substance>
+    </m3-2-body-of-data>
+  </m3-quality>
+</ectd:ectd>

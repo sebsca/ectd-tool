@@ -1,0 +1,20 @@
+<!-- Synthetic eCTD subset for implementation tests, not a regulatory schema. -->
+<!ELEMENT ectd:ectd (m1-administrative-information-and-prescribing-information?,m2-common-technical-document-summaries?,m3-quality?,m4-nonclinical-study-reports?,m5-clinical-study-reports?)>
+<!ATTLIST ectd:ectd xmlns:ectd CDATA #FIXED "http://www.ich.org/ectd" xmlns:xlink CDATA #FIXED "http://www.w3.org/1999/xlink" dtd-version CDATA #FIXED "3.2">
+<!ELEMENT m1-administrative-information-and-prescribing-information (leaf*)>
+<!ELEMENT m2-common-technical-document-summaries (m2-2-introduction?,m2-3-quality-overall-summary?)>
+<!ELEMENT m2-2-introduction (leaf*)>
+<!ELEMENT m2-3-quality-overall-summary (leaf*,m2-3-introduction*,m2-3-s-drug-substance*)>
+<!ELEMENT m2-3-introduction (leaf*)>
+<!ELEMENT m2-3-s-drug-substance (leaf*)>
+<!ATTLIST m2-3-s-drug-substance substance CDATA #IMPLIED manufacturer CDATA #IMPLIED>
+<!ELEMENT m3-quality (m3-2-body-of-data?)>
+<!ELEMENT m3-2-body-of-data (m3-2-s-drug-substance*)>
+<!ELEMENT m3-2-s-drug-substance (leaf*,m3-2-s-1-general-information*)>
+<!ATTLIST m3-2-s-drug-substance substance CDATA #IMPLIED manufacturer CDATA #IMPLIED>
+<!ELEMENT m3-2-s-1-general-information (leaf*)>
+<!ELEMENT m4-nonclinical-study-reports (leaf*)>
+<!ELEMENT m5-clinical-study-reports (leaf*)>
+<!ELEMENT leaf (title)>
+<!ATTLIST leaf ID ID #REQUIRED checksum CDATA #REQUIRED checksum-type (MD5) #REQUIRED operation (new|replace|append|delete) #REQUIRED xlink:href CDATA #IMPLIED modified-file CDATA #IMPLIED>
+<!ELEMENT title (#PCDATA)>

@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE ectd:ectd SYSTEM "util/dtd/ich-ectd-3-2.dtd">
+<ectd:ectd xmlns:ectd="http://www.ich.org/ectd" xmlns:xlink="http://www.w3.org/1999/xlink" dtd-version="3.2">
+  <m1-administrative-information-and-prescribing-information>
+    <leaf ID="regional-0000" operation="new" xlink:href="m1/eu/eu-regional.xml">
+      <title>EU regional backbone</title>
+    </leaf>
+  </m1-administrative-information-and-prescribing-information>
+  <m2-common-technical-document-summaries>
+    <m2-3-quality-overall-summary>
+      <leaf ID="summary-v1" operation="new" xlink:href="m2/summary.txt" checksum="example-only" checksum-type="md5">
+        <title>Quality &amp; safety overview</title>
+        <extension category="demo"><note language="en">Complete nested metadata</note></extension>
+      </leaf>
+    </m2-3-quality-overall-summary>
+  </m2-common-technical-document-summaries>
+  <m3-quality>
+    <m3-2-body-of-data>
+      <m3-2-s-drug-substance substance="Demo substance" manufacturer="Example manufacturer">
+        <leaf ID="substance-v1" operation="new" xlink:href="m3/substance.txt"><title>Drug substance</title></leaf>
+      </m3-2-s-drug-substance>
+    </m3-2-body-of-data>
+  </m3-quality>
+</ectd:ectd>
